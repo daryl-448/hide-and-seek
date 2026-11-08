@@ -1,0 +1,107 @@
+# Shared-feature manifest (SPEC §7, E9). One entry per shared-channel feature.
+#
+#   formula:   definition over the ledger (what the simulator must compute)
+#   transform: log1p | identity | block_ts      (applied before standardization, D5)
+#   sentinel:  raw value for an empty history
+#   status:    audited = matches recomputation on real data (SPEC §2, D1), or
+#              computed by our own code from the edge lists in both domains;
+#              assumed = cannot be recomputed from Elliptic++
+#
+# block_ts: (height - 391200) / 1975 = time steps since the dataset's first
+# block (E19). The raw sentinel 0 ("never") maps to -1 (ours), one step before
+# the dataset window, instead of -198.
+#
+# The 165 anonymized Local_*/Aggregate_* tx features are the target-only
+# adapter (E8), not part of this manifest. Their transform is identity.
+
+block_ts:
+  first_block: 391200
+  blocks_per_step: 1975
+  sentinel_to: -1.0
+
+tx:
+  in_txs_degree:        {formula: "number of in-dataset txs in the same time step whose outputs this tx spends (tx-flow in-degree)", transform: log1p, sentinel: 0, status: audited}
+  out_txs_degree:       {formula: "number of in-dataset txs in the same time step spending this tx's outputs (tx-flow out-degree)", transform: log1p, sentinel: 0, status: audited}
+  total_BTC:            {formula: "out_BTC_total", transform: log1p, sentinel: 0, status: audited}
+  fees:                 {formula: "in_BTC_total - out_BTC_total", transform: log1p, sentinel: 0, status: audited}
+  size:                 {formula: "bytes; simulator: 10 + 148*n_in + 34*n_out", transform: log1p, sentinel: 0, status: assumed}
+  num_input_addresses:  {formula: "number of input addresses; real value is never below the AddrTx link count (equal for 94.6 %)", transform: log1p, sentinel: 0, status: audited}
+  num_output_addresses: {formula: "number of output addresses; real value is never below the TxAddr link count (equal for 99.8 %)", transform: log1p, sentinel: 0, status: audited}
+  in_BTC_min:           {formula: "min input amount", transform: log1p, sentinel: 0, status: assumed}
+  in_BTC_max:           {formula: "max input amount", transform: log1p, sentinel: 0, status: assumed}
+  in_BTC_mean:          {formula: "mean input amount", transform: log1p, sentinel: 0, status: assumed}
+  in_BTC_median:        {formula: "median input amount", transform: log1p, sentinel: 0, status: assumed}
+  in_BTC_total:         {formula: "sum of input amounts", transform: log1p, sentinel: 0, status: assumed}
+  out_BTC_min:          {formula: "min output amount", transform: log1p, sentinel: 0, status: assumed}
+  out_BTC_max:          {formula: "max output amount", transform: log1p, sentinel: 0, status: assumed}
+  out_BTC_mean:         {formula: "mean output amount", transform: log1p, sentinel: 0, status: assumed}
+  out_BTC_median:       {formula: "median output amount", transform: log1p, sentinel: 0, status: assumed}
+  out_BTC_total:        {formula: "sum of output amounts", transform: log1p, sentinel: 0, status: assumed}
+
+# T view (causal, D3): counts over linked txs with time step <= t.
+wallet_T:
+  c_in:    {formula: "distinct txs with ts <= t where the address is an input", transform: log1p, sentinel: 0, status: audited}
+  c_out:   {formula: "distinct txs with ts <= t where the address receives an output", transform: log1p, sentinel: 0, status: audited}
+  c_tot:   {formula: "distinct linked txs with ts <= t", transform: log1p, sentinel: 0, status: audited}
+  c_steps: {formula: "distinct time steps of linked txs with ts <= t", transform: log1p, sentinel: 0, status: audited}
+
+# W view (lifetime): the 55 named wallet features plus derived edge-list features.
+wallet_W:
+  num_txs_as_sender:            {formula: "distinct txs where the address is an input (99.97 % match)", transform: log1p, sentinel: 0, status: audited}
+  "num_txs_as receiver":        {formula: "distinct txs where the address receives an output (98.96 % match)", transform: log1p, sentinel: 0, status: audited}
+  first_block_appeared_in:      {formula: "first block of any linked tx", transform: block_ts, sentinel: 0, status: assumed}
+  last_block_appeared_in:       {formula: "last block of any linked tx", transform: block_ts, sentinel: 0, status: assumed}
+  lifetime_in_blocks:           {formula: "last_block_appeared_in - first_block_appeared_in", transform: log1p, sentinel: 0, status: assumed}
+  total_txs:                    {formula: "distinct linked txs", transform: log1p, sentinel: 0, status: audited}
+  first_sent_block:             {formula: "first block in which the address is an input (real data is non-zero for some never-senders; not reproduced)", transform: block_ts, sentinel: 0, status: assumed}
+  first_received_block:         {formula: "first block in which the address receives an output", transform: block_ts, sentinel: 0, status: assumed}
+  num_timesteps_appeared_in:    {formula: "distinct time steps of linked txs", transform: log1p, sentinel: 0, status: audited}
+  btc_transacted_total:         {formula: "sum over linked txs of BTC sent or received by the address", transform: log1p, sentinel: 0, status: assumed}
+  btc_transacted_min:           {formula: "min of the same per-tx amounts", transform: log1p, sentinel: 0, status: assumed}
+  btc_transacted_max:           {formula: "max of the same per-tx amounts", transform: log1p, sentinel: 0, status: assumed}
+  btc_transacted_mean:          {formula: "mean of the same per-tx amounts", transform: log1p, sentinel: 0, status: assumed}
+  btc_transacted_median:        {formula: "median of the same per-tx amounts", transform: log1p, sentinel: 0, status: assumed}
+  btc_sent_total:               {formula: "sum of BTC spent by the address as an input", transform: log1p, sentinel: 0, status: assumed}
+  btc_sent_min:                 {formula: "min per-tx BTC sent", transform: log1p, sentinel: 0, status: assumed}
+  btc_sent_max:                 {formula: "max per-tx BTC sent", transform: log1p, sentinel: 0, status: assumed}
+  btc_sent_mean:                {formula: "mean per-tx BTC sent", transform: log1p, sentinel: 0, status: assumed}
+  btc_sent_median:              {formula: "median per-tx BTC sent", transform: log1p, sentinel: 0, status: assumed}
+  btc_received_total:           {formula: "sum of BTC received by the address as an output", transform: log1p, sentinel: 0, status: assumed}
+  btc_received_min:             {formula: "min per-tx BTC received", transform: log1p, sentinel: 0, status: assumed}
+  btc_received_max:             {formula: "max per-tx BTC received", transform: log1p, sentinel: 0, status: assumed}
+  btc_received_mean:            {formula: "mean per-tx BTC received", transform: log1p, sentinel: 0, status: assumed}
+  btc_received_median:          {formula: "median per-tx BTC received", transform: log1p, sentinel: 0, status: assumed}
+  fees_total:                   {formula: "sum over linked txs of the full tx fee (counted for senders and receivers)", transform: log1p, sentinel: 0, status: assumed}
+  fees_min:                     {formula: "min full tx fee over linked txs", transform: log1p, sentinel: 0, status: assumed}
+  fees_max:                     {formula: "max full tx fee over linked txs", transform: log1p, sentinel: 0, status: assumed}
+  fees_mean:                    {formula: "mean full tx fee over linked txs", transform: log1p, sentinel: 0, status: assumed}
+  fees_median:                  {formula: "median full tx fee over linked txs", transform: log1p, sentinel: 0, status: assumed}
+  fees_as_share_total:          {formula: "sum over linked txs of fee / tx BTC (reaches 3.64, so not a fraction)", transform: log1p, sentinel: 0, status: assumed}
+  fees_as_share_min:            {formula: "min per-tx fee share", transform: identity, sentinel: 0, status: assumed}
+  fees_as_share_max:            {formula: "max per-tx fee share", transform: identity, sentinel: 0, status: assumed}
+  fees_as_share_mean:           {formula: "mean per-tx fee share", transform: identity, sentinel: 0, status: assumed}
+  fees_as_share_median:         {formula: "median per-tx fee share", transform: identity, sentinel: 0, status: assumed}
+  blocks_btwn_txs_total:        {formula: "sum of block gaps between consecutive linked txs (0 for a single tx)", transform: log1p, sentinel: 0, status: assumed}
+  blocks_btwn_txs_min:          {formula: "min block gap between consecutive linked txs", transform: log1p, sentinel: 0, status: assumed}
+  blocks_btwn_txs_max:          {formula: "max block gap between consecutive linked txs", transform: log1p, sentinel: 0, status: assumed}
+  blocks_btwn_txs_mean:         {formula: "mean block gap between consecutive linked txs", transform: log1p, sentinel: 0, status: assumed}
+  blocks_btwn_txs_median:       {formula: "median block gap between consecutive linked txs", transform: log1p, sentinel: 0, status: assumed}
+  blocks_btwn_input_txs_total:  {formula: "sum of block gaps between consecutive input txs", transform: log1p, sentinel: 0, status: assumed}
+  blocks_btwn_input_txs_min:    {formula: "min block gap between consecutive input txs", transform: log1p, sentinel: 0, status: assumed}
+  blocks_btwn_input_txs_max:    {formula: "max block gap between consecutive input txs", transform: log1p, sentinel: 0, status: assumed}
+  blocks_btwn_input_txs_mean:   {formula: "mean block gap between consecutive input txs", transform: log1p, sentinel: 0, status: assumed}
+  blocks_btwn_input_txs_median: {formula: "median block gap between consecutive input txs", transform: log1p, sentinel: 0, status: assumed}
+  blocks_btwn_output_txs_total: {formula: "sum of block gaps between consecutive output txs", transform: log1p, sentinel: 0, status: assumed}
+  blocks_btwn_output_txs_min:   {formula: "min block gap between consecutive output txs", transform: log1p, sentinel: 0, status: assumed}
+  blocks_btwn_output_txs_max:   {formula: "max block gap between consecutive output txs", transform: log1p, sentinel: 0, status: assumed}
+  blocks_btwn_output_txs_mean:  {formula: "mean block gap between consecutive output txs", transform: log1p, sentinel: 0, status: assumed}
+  blocks_btwn_output_txs_median: {formula: "median block gap between consecutive output txs", transform: log1p, sentinel: 0, status: assumed}
+  num_addr_transacted_multiple: {formula: "counterparty addresses transacted with more than once", transform: log1p, sentinel: 0, status: assumed}
+  transacted_w_address_total:   {formula: "sum over linked txs of the number of counterparty addresses", transform: log1p, sentinel: 0, status: assumed}
+  transacted_w_address_min:     {formula: "min per-tx counterparty count", transform: log1p, sentinel: 0, status: assumed}
+  transacted_w_address_max:     {formula: "max per-tx counterparty count", transform: log1p, sentinel: 0, status: assumed}
+  transacted_w_address_mean:    {formula: "mean per-tx counterparty count", transform: log1p, sentinel: 0, status: assumed}
+  transacted_w_address_median:  {formula: "median per-tx counterparty count", transform: log1p, sentinel: 0, status: assumed}
+  self_loop_frac:               {formula: "self-loop AddrAddr rows / AddrAddr rows with the address as input; 0 if none", transform: identity, sentinel: 0, status: audited}
+  aa_in_degree:                 {formula: "distinct non-self AddrAddr predecessors", transform: log1p, sentinel: 0, status: audited}
+  aa_out_degree:                {formula: "distinct non-self AddrAddr successors", transform: log1p, sentinel: 0, status: audited}

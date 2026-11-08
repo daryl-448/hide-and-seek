@@ -1,0 +1,11 @@
+# S0: official-notebook random-forest anchor (SPEC §6, M2).
+stage: s0
+seeds: [0, 1, 2]
+rf:
+  n_estimators: 50      # the notebook's RandomForestClassifier(n_estimators=50), other params default
+scalings:
+  - train_only          # min-max fitted on the official train split (ours)
+  - notebook            # min-max fitted where the notebook fits it: every row before unknowns are dropped
+acceptance:
+  T: {illicit_f1: 0.828, tol: 0.03}
+  W: {illicit_f1: 0.845, tol: 0.03}
