@@ -1,2 +1,11 @@
 # Source papers (local only, never commit)
 *.pdf
+
+# Dataset (Elliptic++) and anything derived from it: never commit
+dataset/
+data/
+runs/
+
+# Python
+.venv/
+__pycache__/
