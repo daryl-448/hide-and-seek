@@ -1,0 +1,24 @@
+# M3: target-only arm T0 and its val gate (SPEC §11, §12, §15).
+stage: ft
+arm: t0
+tasks: [T, W]
+seeds: [0, 1, 2]
+lambda:                 # §8.4: picked per task by val illicit-F1 of T0 at f = 0.25, seed 0, then frozen
+  grid: [0.1, 0.5]
+  fraction: 0.25
+  seed: 0
+fractions: [1.0]        # the gate runs f = 1.0; the 0.05 / 0.25 grid runs with M7
+train:                  # RunConfig fields (SPEC §6, §13)
+  lr: 1.0e-3
+  batch: 128
+  micro_batch: 128      # 1650S: full 128-target batches fit (< 0.5 GB); lower it if a run OOMs
+  eval_batch: 128
+  max_epochs: 50
+  patience: 5
+  clip: 1.0
+  eps: 0.1
+  p_miss: 0.1
+  dropout: 0.5
+gate:                   # §15 M3: T0 val illicit-F1 >= RF(fitting split) val illicit-F1 - margin, every seed, both tasks
+  margin: 0.05
+  rf_n_estimators: 50

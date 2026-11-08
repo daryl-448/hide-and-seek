@@ -48,3 +48,21 @@ def binary_metrics(y: np.ndarray, score: np.ndarray, threshold: float = 0.5,
             for t in np.unique(ts)
         }
     return out
+
+
+def best_f1_threshold(y: np.ndarray, score: np.ndarray) -> float:
+    """Threshold maximizing illicit F1 of ``score > threshold`` (SPEC §6: chosen on val).
+
+    Cuts only between distinct scores, at their midpoint; ties go to the
+    smaller threshold set (fewer positives).
+    """
+    y = np.asarray(y).astype(np.int64)
+    score = np.asarray(score, dtype=np.float64)
+    order = np.argsort(-score, kind="stable")
+    s, yy = score[order], y[order]
+    tp = np.cumsum(yy)
+    k = np.arange(1, len(s) + 1)
+    f1 = 2 * tp / (k + yy.sum())
+    valid = np.r_[s[1:] < s[:-1], True]
+    i = int(np.argmax(np.where(valid, f1, -1.0)))
+    return float((s[i] + s[i + 1]) / 2) if i + 1 < len(s) else float(np.nextafter(s[-1], -np.inf))
