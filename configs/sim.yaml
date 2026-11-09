@@ -1,0 +1,13 @@
+# M4: static simulator calibration (SPEC §9.6, §9.7). Search bounds live in hns.sim.world.CALIBRATED.
+stage: calib
+calibration:
+  seed: 0
+  n_configs: 50          # "about 50 configurations" (§9.6); config 0 is the WorldParams default
+  worlds: 2              # worlds per configuration (10 time steps each)
+  workers: 6             # processes (CPU only)
+  label_worlds: 3        # worlds used to solve p_ill / p_lic / p_wunk and to score the centre
+  multiverse_draws: 10   # §16: per-world tx counts and illicit share of multiverse draws, before M5
+fixed:                   # not calibrated; §9.5 centre values
+  n_launderers: 25
+  budget: 0.05
+  offset: 0

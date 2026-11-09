@@ -69,11 +69,12 @@ def addr_tx_csr(links: pl.DataFrame, n_tx: int, n_w: int) -> dict[str, np.ndarra
 
 
 def addr_addr(txs: pl.DataFrame, addr_tx: pl.DataFrame, tx_addr: pl.DataFrame,
-              aa_rows: pl.DataFrame, n_w: int) -> tuple[dict[str, np.ndarray], pl.DataFrame]:
+              aa_rows: pl.DataFrame | None, n_w: int) -> tuple[dict[str, np.ndarray], pl.DataFrame]:
     # AddrAddr == AddrTx join TxAddr on txId (audited in D1); the join gives each row's time step.
+    # The simulator has no separate AddrAddr file (aa_rows=None): the join is its definition.
     rows = (addr_tx.join(tx_addr, on="tid").join(txs.select("tid", "ts"), on="tid")
             .select(pl.col("wid").alias("src"), pl.col("wid_right").alias("dst"), "ts"))
-    if rows.height != aa_rows.height:
+    if aa_rows is not None and rows.height != aa_rows.height:
         raise ValueError("AddrAddr is not AddrTx join TxAddr")
     self_rows = rows.filter(pl.col("src") == pl.col("dst")).group_by("src").len()
     as_input = rows.group_by("src").len()

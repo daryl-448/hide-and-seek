@@ -25,8 +25,8 @@ tx:
   total_BTC:            {formula: "out_BTC_total", transform: log1p, sentinel: 0, status: audited}
   fees:                 {formula: "in_BTC_total - out_BTC_total", transform: log1p, sentinel: 0, status: audited}
   size:                 {formula: "bytes; simulator: 10 + 148*n_in + 34*n_out", transform: log1p, sentinel: 0, status: assumed}
-  num_input_addresses:  {formula: "number of input addresses; real value is never below the AddrTx link count (equal for 94.6 %)", transform: log1p, sentinel: 0, status: audited}
-  num_output_addresses: {formula: "number of output addresses; real value is never below the TxAddr link count (equal for 99.8 %)", transform: log1p, sentinel: 0, status: audited}
+  num_input_addresses:  {formula: "number of inputs (spent outputs); real value is never below the AddrTx link count (equal for 94.6 %)", transform: log1p, sentinel: 0, status: audited}
+  num_output_addresses: {formula: "number of outputs; real value is never below the TxAddr link count (equal for 99.8 %)", transform: log1p, sentinel: 0, status: audited}
   in_BTC_min:           {formula: "min input amount", transform: log1p, sentinel: 0, status: assumed}
   in_BTC_max:           {formula: "max input amount", transform: log1p, sentinel: 0, status: assumed}
   in_BTC_mean:          {formula: "mean input amount", transform: log1p, sentinel: 0, status: assumed}

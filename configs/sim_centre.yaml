@@ -1,0 +1,28 @@
+# Multiverse centre, frozen by `python -m hns.sim.calibrate` (SPEC §9.6). Do not hand-edit.
+# code: 8bc9dcd409ce78c8c62fc7b85d7adfa32df06763-dirty
+n_innocents: 3436
+addr_mean: 2.2916832146559134
+bal_mu: 0.962978872964888
+bal_sigma: 1.5293902567768798
+demand_a: 4.238124194829789
+demand_b: 1.2790113665920946
+p_ii: 0.7345513419193511
+pa_exp: 1.4584093351793919
+demand_rate: 0.02433026469131614
+n_services: 20
+batch_size: 87
+consol_interval: 10
+p_fresh: 0.7585504920900679
+fee_mu: -14.016665293446579
+fee_sigma: 0.9022282190320023
+n_launderers: 25
+proceeds_mu: 1.0
+proceeds_sigma: 1.0
+budget: 0.05
+mask_rate: 0.1
+offset: 0
+service_float: 1000.0
+payout_max_wait: 10
+p_ill: 0.20560750690007068
+p_lic: 0.1741655576674779
+p_wunk: 0.48218839416983805

@@ -24,6 +24,7 @@ from hns.data.causal import causal_table
 from hns.data.graph import typed_links
 from hns.data.load import AUG_FEATURES, PARQUET_DIR, TX_FEATURES
 from hns.data.split import official_t, official_w
+from hns.feats import tx_feats, wallet_feats
 
 AUDIT_PATH = Path("data/audit.json")
 MATCH_SLACK = 0.5  # percentage points (§5 D1)
@@ -143,28 +144,24 @@ def audit(parquet_dir: Path = PARQUET_DIR) -> Audit:
     a.eq("unknown wallets linked to a licit tx (%, 1 dp)", round(_pct(x.filter(pl.col("class") == 3)["lic"]), 1), 14.3)
 
     # --- feature-definition audit (§2 table)
+    # The recomputable subset comes from the same hns.feats code the simulator uses (§7).
     d = txs.filter(pl.col("size").is_not_null())
-    rec = {
-        "in_txs_degree": e.group_by("dst").len().rename({"dst": "tid"}),
-        "out_txs_degree": e.group_by("src").len().rename({"src": "tid"}),
-        "num_input_addresses": at.group_by("tid").len(),
-        "num_output_addresses": ta.group_by("tid").len(),
-    }
+    rec = d.select("tid").join(tx_feats.flow_degrees(e), on="tid", how="left").join(
+        tx_feats.address_counts(at, ta), on="tid", how="left").fill_null(0)
+    r = d.select("tid", *rec.columns[1:]).join(rec, on="tid", suffix="_rec")
     rates = {}
-    for f, cnt in rec.items():
-        r = d.select("tid", f).join(cnt, on="tid", how="left").fill_null(0)
-        rates[f] = _pct(r[f] == r["len"])
+    for f in rec.columns[1:]:
+        rates[f] = _pct(r[f] == r[f"{f}_rec"])
         if f.startswith("num_"):
-            a.eq(f"{f} never below link count", int((r[f] < r["len"]).sum()), 0)
+            a.eq(f"{f} never below link count", int((r[f] < r[f"{f}_rec"]).sum()), 0)
     rates["total_BTC"] = _pct(d["total_BTC"] == d["out_BTC_total"])
     fee_err = (d["fees"].cast(pl.Float64) - (d["in_BTC_total"].cast(pl.Float64) - d["out_BTC_total"].cast(pl.Float64))).abs()
     rates["fees"] = _pct(fee_err <= FEES_RTOL * d["in_BTC_total"].cast(pl.Float64).abs() + FEES_ATOL)
 
     ws = w.select("wid", "num_txs_as_sender", "num_txs_as receiver", "total_txs", "num_timesteps_appeared_in")
-    lw = links.join(ts, on="tid").group_by("wid").agg(pl.len().alias("tot"), pl.col("ts").n_unique().alias("nts"))
-    ws = (ws.join(at.group_by("wid").len().rename({"len": "ns"}), on="wid", how="left")
-          .join(ta.group_by("wid").len().rename({"len": "nr"}), on="wid", how="left")
-          .join(lw, on="wid", how="left").fill_null(0))
+    lw = wallet_feats.link_counts(at, ta, ts).rename(
+        {"num_txs_as_sender": "ns", "num_txs_as receiver": "nr", "total_txs": "tot", "num_timesteps_appeared_in": "nts"})
+    ws = ws.join(lw, on="wid", how="left").fill_null(0)
     for f, c in [("num_txs_as_sender", "ns"), ("num_txs_as receiver", "nr"), ("total_txs", "tot"),
                  ("num_timesteps_appeared_in", "nts")]:
         rates[f] = _pct(ws[f] == ws[c])
