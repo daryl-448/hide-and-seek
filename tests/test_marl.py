@@ -164,7 +164,7 @@ def test_da_heads_and_aux_losses():
 # ---------------------------------------------------------------------------- observations
 @pytest.fixture(scope="module")
 def played():
-    env = SimEnv(TINY, seed=3)
+    env = SimEnv(TINY, seed=17)
     env.graph = LiveGraph()
     env.start_episode(0)
     for _ in range(4):
@@ -583,9 +583,65 @@ def test_a_flagged_setup_freezes_its_change_and_the_btc_accounting_closes(amount
     lost = bal0 - a["fees"]                                   # the whole source, less the setup's fee
     assert math.isclose(a["frozen"], lost, rel_tol=1e-12) and a["cashed"] == 0.0
     assert math.isclose(a["frozen_change"], (1.0 - amount) * lost, rel_tol=1e-9, abs_tol=1e-15)
-    assert math.isclose(tr.reward, -1.0, rel_tol=1e-9)        # the per-tranche reward still ignores the change
+    assert math.isclose(tr.reward, -lost / env.d_w, rel_tol=1e-9)    # the reward counts everything frozen
+    assert math.isclose(tr.reward_tranche, -1.0, rel_tol=1e-9)       # M5's per-tranche diagnostic ignores the change
     f = mt.btc_fractions(env)
     assert abs(f["accounting_gap"]) < 1e-12 and math.isclose(f["frozen_frac"], lost / a["proceeds"], rel_tol=1e-12)
+
+
+def test_proceeds_are_drawn_up_front_and_set_the_reward_unit():
+    a, b = SimEnv(TINY, 9), SimEnv(TINY, 9)
+    assert a.proceeds.shape == (10, TINY.n_launderers) and np.array_equal(a.proceeds, b.proceeds)
+    assert math.isclose(a.d_w, a.proceeds.sum() / (10 * TINY.n_launderers), rel_tol=1e-12)
+    for e in range(2):
+        a.start_episode(e)
+        for _ in range(3):
+            a.step()
+    assert math.isclose(a.acct["proceeds"], a.proceeds[:2].sum(), rel_tol=1e-12)
+    assert not np.array_equal(SimEnv(TINY, 10).proceeds, a.proceeds)
+
+
+class _Repeat:
+    """Launderer 0 launches ``direct`` at ``amount`` at every idle decision; everyone else waits."""
+
+    def __init__(self, amount):
+        self.amount = amount
+
+    def act(self, env, states):
+        from hns.sim.entities import AMOUNTS, GO, STRATEGIES, WAIT
+        out = {}
+        for i, st in states.items():
+            a = {b: int(np.flatnonzero(st.masks[b])[0]) for b in st.branches}
+            a["initiate"] = WAIT
+            if i == 0 and len(st.branches) == 6 and st.masks["amount"][AMOUNTS.index(self.amount)]:
+                a.update(initiate=GO, amount=AMOUNTS.index(self.amount), strategy=STRATEGIES.index("direct"))
+            out[i] = a
+        return out
+
+
+class _FlagLicitFirst(_FlagIllicit):
+    def score(self, env, cands):
+        return -super().score(env, cands)
+
+
+@pytest.mark.parametrize("amount", [0.1, 1.0])
+def test_launderer_reward_is_btc_over_d_w_whatever_the_tranche_size(amount):
+    env = SimEnv(TINY, 5, launderers=_Repeat(amount), detector=_FlagLicitFirst())
+    env.start_episode(0)
+    total = tranche = hold = 0.0
+    for _ in range(30):
+        env.budget = 0.0                                      # nothing is flagged
+        res = env.step()
+        for t in res.transitions:
+            if t.role == "launderer" and t.agent == 0:
+                total, tranche = total + t.reward, tranche + t.reward_tranche
+                hold += 0.001 if not t.noop and env.funds(env.launderers[0]) > 0 else 0.0
+    n = int(env.acct["strategy"].sum())
+    assert env.acct["frozen"] == 0.0 and (n >= 20 if amount == 0.1 else n == 1)
+    # the reward is the BTC cashed out over D_w, however many tranches carried it ...
+    assert math.isclose(total + hold, env.acct["cashed"] / env.d_w, rel_tol=1e-9)
+    # ... while M5's per-tranche reward paid +1 per tranche
+    assert math.isclose(tranche + hold, n, rel_tol=1e-9)
 
 
 def test_btc_accounting_closes_over_a_static_world():

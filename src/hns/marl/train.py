@@ -225,6 +225,8 @@ class Trainer:
                 L.buf.set(L.tail[tr.agent], [tr.action.get(b, 0) for b in L.branches],
                           [b in tr.realized for b in L.branches], tr.reward)
             ep[f"r_{tr.role}"] += tr.reward
+            if tr.role == "launderer":
+                ep["r_launderer_tranche"] += tr.reward_tranche      # M5's first reward, a diagnostic (§9.3)
         inn = self.roles["innocent"]
         for i, r in res.continuation_rewards.items():
             if "innocent" in self.learn and i in inn.tail:
@@ -318,6 +320,7 @@ class Trainer:
             ratio.append(ep["illicit"] / max(ep["licit"], 1.0))
             self._write({"kind": "episode", "episode": self.episode, "world": w, "eps": self.eps,
                          "reward_launderer": ep["r_launderer"] / params.n_launderers,
+                         "reward_launderer_tranche": ep["r_launderer_tranche"] / params.n_launderers,
                          "reward_innocent": ep["r_innocent"] / params.n_innocents, "reward_detector": ep["r_detector"],
                          "illicit_licit_ratio": ratio[-1],
                          "detection_rate": ep["cash_flag"] / max(ep["cash"], 1.0), "n_tx": int(ep["n_commit"])})
@@ -348,7 +351,8 @@ class Trainer:
             "kind": "epoch", "world": w, "episode": (w + 1) * EPISODES, "eps": self.eps,
             "reward": {"launderer": tot["r_launderer"] / params.n_launderers / EPISODES,
                        "innocent": tot["r_innocent"] / params.n_innocents / EPISODES,
-                       "detector": tot["r_detector"] / EPISODES},
+                       "detector": tot["r_detector"] / EPISODES,
+                       "launderer_tranche": tot["r_launderer_tranche"] / params.n_launderers / EPISODES},
             "detection_rate": tot["cash_flag"] / max(tot["cash"], 1.0),
             "illicit_licit_ratio": float(np.mean(ratio)),
             **btc_fractions(env),

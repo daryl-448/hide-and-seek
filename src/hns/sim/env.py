@@ -37,9 +37,14 @@ spendable balance (:meth:`SimEnv.launderer_held`) these close:
 
 Rewards (§9.3, magnitudes ours):
 
-- launderer: ``(cashed out undetected - tranche funds frozen) / tranche``
-  per sub-step, ``-0.001`` per sub-step while it holds funds. The frozen
-  change of a flagged setup is not in this reward;
+- launderer: ``(BTC cashed out undetected - BTC frozen) / D_w`` per sub-step,
+  everything a flagged tx froze included (its change too), and ``-0.001``
+  per sub-step while it holds funds. ``D_w`` is the world's mean proceeds per
+  launderer and episode: every launderer's proceeds for the world are drawn
+  at creation, on their own RNG stream, and credited at each episode's start.
+  The reward of M5's first runs, ``(cashed - tranche funds frozen) /
+  tranche`` per hop (same holding cost), is kept in
+  ``Transition.reward_tranche`` as a diagnostic;
 - innocent: ``+0.1`` when its decision's tx commits (a flagged tx is blocked);
   a forward route's scripted hop 2 earns its ``+0.1`` in ``continuation_rewards``.
 
@@ -84,6 +89,7 @@ class Transition:
     realized: tuple[str, ...] = ()
     reward: float = 0.0
     noop: bool = False
+    reward_tranche: float = 0.0     # launderers: M5's first per-tranche reward, a diagnostic
 
 
 @dataclass
@@ -139,11 +145,16 @@ class RandomDetector:
 class SimEnv:
     def __init__(self, params: WorldParams, seed: int, launderers=None, innocents=None, detector=None):
         self.p = params
-        dyn, pol, lab, det = np.random.SeedSequence(seed).spawn(4)
+        dyn, pol, lab, det, prc = np.random.SeedSequence(seed).spawn(5)
         self.rng = np.random.default_rng(dyn)
         self.policy_rng = np.random.default_rng(pol)
         self.label_rng = np.random.default_rng(lab)
         self.detector_rng = np.random.default_rng(det)
+        # §9.3: every launderer's proceeds for the world's episodes, drawn up front on their own stream, and
+        # D_w, the world's mean proceeds per launderer and episode (the launderer reward's unit)
+        self.proceeds = np.random.default_rng(prc).lognormal(params.proceeds_mu, params.proceeds_sigma,
+                                                              size=(EPISODES, params.n_launderers))
+        self.d_w = float(self.proceeds.mean()) if params.n_launderers else 1.0
         self.launderer_policy = launderers or StaticLaunderers()
         self.innocent_policy = innocents or ScriptedInnocents()
         self.detector = detector or RandomDetector()
@@ -178,10 +189,10 @@ class SimEnv:
         self.launderers = [Launderer(i, led.new_address(ROLE_LAUNDERER, i)) for i in range(p.n_launderers)]
 
     def start_episode(self, episode: int):
-        """New time step: launderers receive this episode's proceeds (ours)."""
+        """New time step: launderers receive this episode's proceeds, drawn at world creation (ours)."""
         self.episode, self.sub = episode, 0
         for L in self.launderers:
-            amt = float(self.rng.lognormal(self.p.proceeds_mu, self.p.proceeds_sigma))
+            amt = float(self.proceeds[episode, L.id])
             self.ledger.genesis(L.source, amt)
             self.acct["proceeds"] += amt
 
@@ -507,8 +518,9 @@ class SimEnv:
         for pr in valid:
             getattr(self, f"_on_{pr.kind}")(pr)
         for tr in trs:
-            if tr.role == "launderer" and not tr.noop:
-                tr.reward += -0.001 if self.funds(self.launderers[tr.agent]) > 0 else 0.0
+            if tr.role == "launderer" and not tr.noop and self.funds(self.launderers[tr.agent]) > 0:
+                tr.reward -= 0.001
+                tr.reward_tranche -= 0.001
         self.budget = float(np.clip(self.budget * BUDGET_MULT[d_act["update_strategy"]], *BUDGET_RANGE))
         self.sub += 1
         self.g += 1
@@ -516,10 +528,10 @@ class SimEnv:
 
     # ------------------------------------------------------------------ outcomes
     def _tranche_flows(self, L: Launderer, pr: Proposal) -> tuple[list[int], float, float]:
-        """(next holders, BTC cashed out undetected, tranche BTC frozen) of a launderer proposal.
+        """(next holders, BTC cashed out undetected, tranche BTC frozen, change BTC frozen) of a launderer proposal.
 
-        ``acct`` gets everything a flagged tx froze, its change to the source included (a frozen tx freezes all
-        of its outputs); the returned tranche figure, which the reward uses, leaves that change out.
+        A frozen tx freezes all of its outputs, its change to the source included: the reward and ``acct`` count
+        both parts; the per-tranche diagnostic counts the tranche part only, as M5's first runs did.
         """
         nxt, cash, frozen, frozen_change = [], 0.0, 0.0, 0.0
         for r, out in zip(pr.resolved, pr.outcomes):
@@ -534,11 +546,15 @@ class SimEnv:
         self.acct["cashed"] += cash
         self.acct["frozen"] += frozen + frozen_change
         self.acct["frozen_change"] += frozen_change
-        return list(dict.fromkeys(nxt)), cash, frozen
+        return list(dict.fromkeys(nxt)), cash, frozen, frozen_change
+
+    def _reward(self, pr: Proposal, T: Tranche, cash: float, frozen: float, frozen_change: float) -> None:
+        pr.tr.reward += (cash - frozen - frozen_change) / self.d_w
+        pr.tr.reward_tranche += (cash - frozen) / T.amount
 
     def _on_setup(self, pr: Proposal):
         L, T, s = self.launderers[pr.owner], pr.tranche, pr.resolved[0].spec
-        nxt, cash, frozen = self._tranche_flows(L, pr)
+        nxt, cash, frozen, frozen_change = self._tranche_flows(L, pr)
         T.amount = s.meta["tranche"]
         self.acct["strategy"][T.strategy] += 1
         if pr.outcomes[0] == "committed" and s.meta["new_source"] >= 0:
@@ -548,16 +564,16 @@ class SimEnv:
         if STRATEGIES[T.strategy] == "cycle" and nxt:
             T.first_mule = nxt[0]
         L.tranche = T if (T.plan and T.holders) else None
-        pr.tr.reward += (cash - frozen) / T.amount
+        self._reward(pr, T, cash, frozen, frozen_change)
 
     def _on_hop(self, pr: Proposal):
         L = self.launderers[pr.owner]
         T = L.tranche
-        nxt, cash, frozen = self._tranche_flows(L, pr)
+        nxt, cash, frozen, frozen_change = self._tranche_flows(L, pr)
         T.plan = T.plan[1:]
         T.holders = nxt
         L.tranche = T if (T.plan and T.holders) else None
-        pr.tr.reward += (cash - frozen) / T.amount
+        self._reward(pr, T, cash, frozen, frozen_change)
 
     def _on_demand(self, pr: Proposal):
         i, s = pr.owner, pr.resolved[0].spec

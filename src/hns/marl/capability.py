@@ -40,6 +40,22 @@ target, which the SPEC change asks for). Dropout: the setting that passes; if bo
 mean absolute calibration bias over the two opponents. If no root variant passes, the learner needs repair
 before any pilot.
 
+**Result under the per-tranche reward** (``runs/capability/tranche``, commit 98369af; report section 1): no variant
+passed against both opponents. Dropout 0.5 diverged under both targets (max ``Q`` 124 to 3,901); the mean target
+over-estimated at dropout 0; the root target at dropout 0 passed against NDA seed 1 only. Against Full seed 0 it
+split its proceeds into 4 to 7 direct tranches per episode, which the per-tranche reward pays +1 each, and its
+returns ran past what its values learned.
+
+**Follow-up under the per-proceeds reward (declared 2026-11-10, before its runs).** The SPEC (§9.3, revised)
+replaces the reward with the BTC cashed minus all BTC frozen, change included, over ``D_w``, the world's mean
+proceeds per launderer and episode, so that splitting no longer pays. The follow-up re-runs the root target at both
+dropouts (the SPEC fixes the root target) against the same two opponents under that reward. Everything else is as
+above: design, training, evaluation worlds, and the references, re-evaluated because their rewards change. P1 and
+P2 are unchanged, except that P1's bound on ``Q`` becomes, per evaluation world, the most a launderer can cash
+there: ``max_L sum_e proceeds[e, L] / D_w + tau ln 2 / (1 - gamma)``. M5's per-tranche reward is logged as a
+diagnostic (``reward_tranche``). The choice rule is as above with the target fixed to root. If neither dropout passes
+against both opponents, the learner needs further repair before any pilot.
+
 Usage::
 
     python -m hns.marl.capability train --opp runs/marl/full/0 --target root --q-dropout 0
@@ -71,7 +87,14 @@ from hns.sim.live import LiveGraph
 from hns.sim.multiverse import draw_world
 from hns.sim.world import EPISODES, SUBSTEPS, WorldParams
 
-ROOT = Path("runs/capability")
+RUNS = Path("runs/capability")
+REWARD = "proceeds"         # the launderer reward the simulator pays now; "tranche" was M5's (commit 98369af)
+ROOT = RUNS / REWARD
+SECTIONS = {
+    "tranche": "M5's per-tranche reward (commit 98369af): `(cashed - frozen tranche) / tranche` per tranche.",
+    "proceeds": "The per-proceeds reward (§9.3, revised): `(cashed - all frozen) / D_w`. The per-tranche reward is "
+                "logged as a diagnostic.",
+}
 REPORT = Path("reports/m5_capability.md")
 OPP_EPS = 0.05
 WORLDS, EPS_EPISODES, SEED = 30, 150, 0
@@ -202,8 +225,11 @@ def play_world(tr: mt.Trainer, lpol, j: int) -> dict:
             tot[k] += v
     tr.learn = learn
     n_le = params.n_launderers * EPISODES
+    cfg = tr.cfg
+    q_cap = float(env.proceeds.sum(0).max() / env.d_w + cfg.tau * math.log(2.0) / (1.0 - cfg.gamma))
     out = {"world": j, "n_launderers": params.n_launderers, "budget0": params.budget,
-           "reward": tot["r_launderer"] / n_le, "tranches": float(env.acct["strategy"].sum()) / n_le,
+           "reward": tot["r_launderer"] / n_le, "reward_tranche": tot["r_launderer_tranche"] / n_le, "q_cap": q_cap,
+           "tranches": float(env.acct["strategy"].sum()) / n_le,
            "detection_rate": tot["cash_flag"] / max(tot["cash"], 1.0), "idle_go_rate": tot["idle_go"] / max(tot["idle"], 1.0),
            "budget_mean": tot["budget"] / (EPISODES * SUBSTEPS), **mt.btc_fractions(env),
            "strategy_share": dict(zip(STRATEGIES, (launches["strategy"] / max(launches["strategy"].sum(), 1)).tolist())),
@@ -316,9 +342,9 @@ def _t95(x: np.ndarray) -> tuple[float, float, float]:
     return m, m - h, m + h
 
 
-def verdicts(root: Path = ROOT) -> list[dict]:
-    """Every variant's P1 / P2 verdict per opponent, from the result files."""
-    cfg = MarlConfig()
+def verdicts(reward: str = REWARD) -> list[dict]:
+    """Every variant's P1 / P2 verdict per opponent under ``reward``, from the result files."""
+    cfg, root = MarlConfig(), RUNS / reward
     rows = []
     for f in sorted(root.glob("*_d*/result.json")):
         res = json.loads(f.read_text())
@@ -330,9 +356,12 @@ def verdicts(root: Path = ROOT) -> list[dict]:
         util = np.array([e["btc_utility"] for e in ev])
         qn = sum(e.get("q_n", 0) for e in ev)
         qmax = max(e.get("q_max", -math.inf) for e in ev)
+        # P1's bound: Q_MAX under the per-tranche reward; per world, the most a launderer can cash under the other
+        cap = {e["world"]: q_max(cfg) if reward == "tranche" else e["q_cap"] for e in ev}
+        q_over = max((e["q_max"] / cap[e["world"]] for e in ev if e.get("q_n")), default=0.0)
         bias = sum(e["q_bias"] * e["q_n"] for e in ev if e.get("q_n")) / max(qn, 1)
         gabs = sum(e["g_abs_mean"] * e["q_n"] for e in ev if e.get("q_n")) / max(qn, 1)
-        p1 = res["finite"] and qmax <= q_max(cfg) and abs(bias) <= max(0.5, 0.25 * gabs)
+        p1 = res["finite"] and q_over <= 1.0 and abs(bias) <= max(0.5, 0.25 * gabs)
         d_wait = _t95(rew - ref["wait"])
         p2 = rew.mean() >= 0.5 * ref["direct50"].mean() and d_wait[1] > 0
         share = defaultdict(float)
@@ -347,40 +376,51 @@ def verdicts(root: Path = ROOT) -> list[dict]:
                      "q_dropout": res["q_dropout"], "reward": rew.mean(), "ref": {p: ref[p].mean() for p in REFS},
                      "d_wait": d_wait, "d_direct50": _t95(rew - ref["direct50"]), "utility": util.mean(),
                      "ref_utility": {p: np.mean([e["btc_utility"] for e in refs[p]]) for p in REFS},
-                     "tranches": np.mean([e["tranches"] for e in ev]), "q_max": qmax, "q_bias": bias, "g_abs": gabs,
+                     "tranches": np.mean([e["tranches"] for e in ev]), "q_max": qmax, "q_over": q_over,
+                     "q_bias": bias, "g_abs": gabs,
+                     "reward_tranche": np.mean([e.get("reward_tranche", e["reward"]) for e in ev]),
                      "dropout_gap": res["dropout_gap"], "finite": res["finite"], "p1": p1, "p2": p2,
                      "pass": p1 and p2, "share": dict(share), "amount": dict(amt),
                      "detection": np.mean([e["detection_rate"] for e in ev])})
     return rows
 
 
-def cmd_report(a) -> None:
-    rows = verdicts()
-    lines = ["# M5 follow-up: frozen-opponent learner capability", "",
-             "Design and pass criteria: `hns.marl.capability` (declared before the runs). Each row: a fresh launderer "
-             f"trained for {WORLDS} worlds against a frozen M5 inspector and innocents (epsilon {OPP_EPS}), then "
-             f"evaluated at epsilon 0 on {EVAL_WORLDS} held-out worlds shared by every row. Rewards are M5's (per "
-             "tranche). Reward: per launderer and episode. Utility: (cashed - all frozen) / proceeds.", "",
+def report_section(reward: str, n: int) -> list[str]:
+    rows = verdicts(reward)
+    lines = [f"## {n}. {SECTIONS[reward]}", "",
              "| Opponent | Target | Q dropout | Reward | wait / uniform / direct50 | Learned - wait (95 % CI) | "
-             "Utility | direct50 utility | Max Q | Q bias (mean abs G) | Dropout gap | P1 | P2 | Pass |",
+             "Utility | direct50 utility | Max Q (÷ cap) | Q bias (mean abs G) | Dropout gap | P1 | P2 | Pass |",
              "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
         dw = r["d_wait"]
         lines.append(f"| {r['opponent']} | {r['target']} | {r['q_dropout']:g} | {r['reward']:+.3f} | "
                      f"{r['ref']['wait']:+.3f} / {r['ref']['uniform']:+.3f} / {r['ref']['direct50']:+.3f} | "
                      f"{dw[0]:+.3f} ({dw[1]:+.3f}, {dw[2]:+.3f}) | {r['utility']:+.3f} | "
-                     f"{r['ref_utility']['direct50']:+.3f} | {r['q_max']:.1f} | {r['q_bias']:+.2f} ({r['g_abs']:.2f}) | "
+                     f"{r['ref_utility']['direct50']:+.3f} | {r['q_max']:.1f} ({r['q_over']:.2f}) | "
+                     f"{r['q_bias']:+.2f} ({r['g_abs']:.2f}) | "
                      f"{'—' if r['dropout_gap'] is None else format(r['dropout_gap'], '+.2f')} | "
                      f"{'yes' if r['p1'] else 'no'} | {'yes' if r['p2'] else 'no'} | {'**yes**' if r['pass'] else 'no'} |")
     lines += ["", "Learned launch mix (share of launches, mean over evaluation worlds):", "",
-              "| Opponent | Target | Q dropout | Tranches / L / episode | Top strategies | Amounts 10 / 25 / 50 / 100 % | "
-              "Detection rate |", "|---|---|---|---|---|---|---|"]
+              "| Opponent | Target | Q dropout | Tranches / L / episode | Per-tranche reward | Top strategies | "
+              "Amounts 10 / 25 / 50 / 100 % | Detection rate |", "|---|---|---|---|---|---|---|---|"]
     for r in rows:
         top = ", ".join(f"`{k}` {v:.2f}" for k, v in sorted(r["share"].items(), key=lambda x: -x[1])[:3])
         am = " / ".join(f"{r['amount'].get(str(x), 0):.2f}" for x in AMOUNTS)
-        lines.append(f"| {r['opponent']} | {r['target']} | {r['q_dropout']:g} | {r['tranches']:.2f} | {top} | {am} | "
-                     f"{r['detection']:.2f} |")
-    REPORT.write_text("\n".join(lines) + "\n")
+        lines.append(f"| {r['opponent']} | {r['target']} | {r['q_dropout']:g} | {r['tranches']:.2f} | "
+                     f"{r['reward_tranche']:+.3f} | {top} | {am} | {r['detection']:.2f} |")
+    return lines + [""]
+
+
+def cmd_report(a) -> None:
+    lines = ["# M5 follow-up: frozen-opponent learner capability", "",
+             "Design and pass criteria: `hns.marl.capability` (declared before the runs). Each row: a fresh launderer "
+             f"trained for {WORLDS} worlds against a frozen M5 inspector and innocents (epsilon {OPP_EPS}), then "
+             f"evaluated at epsilon 0 on {EVAL_WORLDS} held-out worlds shared by every row. Reward: per launderer and "
+             "episode. Utility: (cashed - all frozen) / proceeds. Max Q: over the evaluation decisions; ÷ cap, the "
+             "largest ratio to P1's bound over the worlds (at most 1 to pass).", ""]
+    for n, reward in enumerate((r for r in SECTIONS if (RUNS / r).is_dir()), 1):
+        lines += report_section(reward, n)
+    REPORT.write_text("\n".join(lines))
     print("\n".join(lines))
 
 
