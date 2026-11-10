@@ -1,0 +1,31 @@
+# M5: MARL pretraining, arms Full and NDA (SPEC §10, §11, §13).
+# One run: uv run python -m hns.marl.train configs/marl.yaml --arm full --seed 0
+stage: marl
+centre: configs/sim_centre.yaml   # the frozen multiverse centre (M4)
+arms: [full, nda]
+seeds: [0, 1, 2]
+train:                  # MarlConfig fields
+  episodes: 1000        # MAX_EPISODES (paper) = 100 worlds = 100 epochs
+  lr: 1.0e-3
+  gamma: 0.99
+  tau: 0.01             # ENTROPY_COEF, used as the soft-Q temperature (G7)
+  batch: 128
+  clip: 1.0
+  dropout: 0.5
+  beta: 0.01
+  lam: 0.1              # lambda_MARL: preset, chosen without real labels (§8.4)
+  fgsm_eps: 0.1
+  buffer: 100000
+  warmup: 1000
+  polyak: 0.005
+  eps_start: 1.0
+  eps_end: 0.05
+  eps_episodes: 300
+  k1: 10
+  k2: 5
+  cap: 512
+  obs_cap: 256
+  pool_worlds: 2        # ours: finished worlds kept as L_y^src sources, besides the current one
+  global_scale: 100.0   # ours: reward unit of the inspector's global branches, 1 / (1 - gamma)
+  ckpt_worlds: 2        # checkpoint every 20 episodes
+  amp: none

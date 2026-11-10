@@ -22,8 +22,13 @@ Static mode (calibration, NMAI): :class:`StaticLaunderers` draw every branch
 uniformly over its feasible options, :class:`ScriptedInnocents` pay now,
 directly, in one output, and both send change to a fresh address with
 probability ``p_fresh``. :class:`RandomDetector` scores uniformly at random
-at depth 1 and keeps its budget. Agent observations (the agent-view HRG) are
-built in M5 and are not part of this module.
+at depth 1 and keeps its budget.
+
+Learned policies (M5) observe through ``env.graph``, an optional
+:class:`hns.sim.live.LiveGraph` that the env keeps equal to the committed
+ledger: the tentative txs of a sub-step are added for scoring (step 4) and
+popped again before the commit, so a reverted tx leaves no trace in it
+either. ``env.acct`` accumulates what the §10 health checks need.
 
 Rewards (§9.3, magnitudes ours):
 
@@ -49,6 +54,7 @@ import numpy as np
 
 from hns.feats.tx_feats import tx_size
 from hns.sim import labels, typologies
+from hns.sim.live import tx_batch
 from hns.sim.entities import (AMOUNTS, BUDGET_MULT, BUDGET_RANGE, DETECTOR_BRANCHES, FRESH, INIT_DEFER,
                               INIT_NOW, INNOCENT_BRANCHES, K_RECIPIENTS, LAUNDERER_BRANCHES, REUSE, ROUTE_DIRECT,
                               ROUTE_FORWARD, ROUTE_SERVICE, STRATEGIES, WAIT, AgentState, Demand, Launderer,
@@ -139,6 +145,9 @@ class SimEnv:
         self.budget = params.budget
         self.episode, self.sub, self.g = 0, 0, 0
         self.deposit: dict[tuple[int, int, int], int] = {}   # (role, owner, service) -> deposit address
+        self.graph = None      # optional LiveGraph (M5)
+        # health accounting (§10): launderer BTC received / cashed out undetected / frozen, tranches per strategy
+        self.acct = {"proceeds": 0.0, "cashed": 0.0, "frozen": 0.0, "strategy": np.zeros(len(STRATEGIES), np.int64)}
         self._build()
 
     # ------------------------------------------------------------------ world
@@ -164,13 +173,21 @@ class SimEnv:
         """New time step: launderers receive this episode's proceeds (ours)."""
         self.episode, self.sub = episode, 0
         for L in self.launderers:
-            self.ledger.genesis(L.source, float(self.rng.lognormal(self.p.proceeds_mu, self.p.proceeds_sigma)))
+            amt = float(self.rng.lognormal(self.p.proceeds_mu, self.p.proceeds_sigma))
+            self.ledger.genesis(L.source, amt)
+            self.acct["proceeds"] += amt
+
+    def end_episode(self):
+        """The time step is over: freeze its causal wallet counts in the live graph."""
+        if self.graph is not None:
+            self.graph.end_step(self.ts, len(self.ledger.addr_role))
 
     def run_world(self):
         for e in range(EPISODES):
             self.start_episode(e)
             for _ in range(SUBSTEPS):
                 self.step()
+            self.end_episode()
 
     @property
     def ts(self) -> int:
@@ -238,7 +255,7 @@ class SimEnv:
             else:
                 svc = int(rng.integers(p.n_services))
                 rcpt = self.deposit_addr(ROLE_INNOCENT, int(i), svc)
-            self.pending[i] = Demand(rcpt, amt, svc)
+            self.pending[i] = Demand(rcpt, amt, svc, born=self.g)
 
     def _pa_draw(self, exclude: int = -1) -> int:
         j = min(int(np.searchsorted(self._pa_cdf, self.rng.random(), side="right")), len(self._pa_cdf) - 1)
@@ -431,7 +448,13 @@ class SimEnv:
 
         # 4-5. score and flag
         cands = [(pr, r) for pr in valid for r in pr.resolved]
+        batch = None
+        if self.graph is not None:   # the detector scores s_t plus the tentative txs, as if committed
+            batch = tx_batch(led, [r for _, r in cands], self.ts)
+            self.graph.add(batch)
         scores = np.asarray(self.detector.score(self, [r for _, r in cands]), dtype=np.float64)
+        if batch is not None:
+            self.graph.pop(batch)
         n_flag = int(round(self.budget * len(cands)))
         flagged = np.zeros(len(cands), bool)
         flagged[np.argsort(-scores, kind="stable")[:n_flag]] = True
@@ -463,6 +486,8 @@ class SimEnv:
                 elif cash:
                     d_reward -= 1.0
                 ci += 1
+        if batch is not None:
+            self.graph.add(batch.take(np.array([c["tid"] >= 0 for c in info], dtype=bool)))
 
         # 7. owner state and rewards
         for pr in valid:
@@ -486,12 +511,15 @@ class SimEnv:
                 cash += sum(a for x, a in r.outputs if x == r.spec.meta["cash"])
             else:
                 frozen += sum(a for x, a in r.outputs if x not in change)
+        self.acct["cashed"] += cash
+        self.acct["frozen"] += frozen
         return list(dict.fromkeys(nxt)), cash, frozen
 
     def _on_setup(self, pr: Proposal):
         L, T, s = self.launderers[pr.owner], pr.tranche, pr.resolved[0].spec
         nxt, cash, frozen = self._tranche_flows(L, pr)
         T.amount = s.meta["tranche"]
+        self.acct["strategy"][T.strategy] += 1
         if pr.outcomes[0] == "committed" and s.meta["new_source"] >= 0:
             L.source = s.meta["new_source"]
         T.plan = T.plan[1:]

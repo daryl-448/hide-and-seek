@@ -5,6 +5,7 @@
 /dataset/
 /data/
 /runs/
+.git_sha
 
 # Python
 .venv/

@@ -42,12 +42,15 @@ REPORT = Path("reports/s0_anchor.md")
 
 
 def git_sha() -> str:
+    """HEAD, with ``-dirty`` for an unclean tree. Off the repo (a code tarball on a rented machine), the
+    ``.git_sha`` file that ``scripts/jl_upload.sh`` writes."""
     try:
         sha = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
         dirty = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip()
         return sha + ("-dirty" if dirty else "")
     except (OSError, subprocess.CalledProcessError):
-        return "unknown"
+        f = Path(".git_sha")
+        return f.read_text().strip() if f.exists() else "unknown"
 
 
 def task_data(task: str, parquet_dir: Path = PARQUET_DIR) -> dict:

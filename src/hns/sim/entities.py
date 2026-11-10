@@ -71,6 +71,7 @@ class Demand:
     second: int = -1          # forward: the innocent's own intermediate address
     split: int = 1
     change: int = FRESH
+    born: int = 0             # global sub-step at which the demand arose
 
 
 @dataclass

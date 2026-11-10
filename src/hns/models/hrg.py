@@ -257,6 +257,7 @@ class Views:
     dst: np.ndarray         # message destination node index
     etype: np.ndarray       # relation as seen from dst
     logmult: np.ndarray
+    kind: np.ndarray | None = None   # node kind (0 tx, 1 wallet, 2 controller); None: ``node_g >= n_tx`` is a wallet
 
 
 class ViewSampler:
