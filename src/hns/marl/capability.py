@@ -96,6 +96,7 @@ SECTIONS = {
                 "logged as a diagnostic.",
 }
 REPORT = Path("reports/m5_capability.md")
+NOTES = "<!-- findings: hand-written below; `report` keeps them -->"
 OPP_EPS = 0.05
 WORLDS, EPS_EPISODES, SEED = 30, 150, 0
 EVAL_WORLDS, EVAL_SALT, EVAL_STEP = 8, 777_000, 10_000_000
@@ -420,7 +421,10 @@ def cmd_report(a) -> None:
              "largest ratio to P1's bound over the worlds (at most 1 to pass).", ""]
     for n, reward in enumerate((r for r in SECTIONS if (RUNS / r).is_dir()), 1):
         lines += report_section(reward, n)
-    REPORT.write_text("\n".join(lines))
+    old = REPORT.read_text() if REPORT.exists() else ""
+    if NOTES in old:                                           # hand-written findings survive a regeneration
+        lines.append(old[old.index(NOTES):].rstrip("\n"))
+    REPORT.write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
 
 
