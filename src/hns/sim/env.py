@@ -28,12 +28,18 @@ Learned policies (M5) observe through ``env.graph``, an optional
 :class:`hns.sim.live.LiveGraph` that the env keeps equal to the committed
 ledger: the tentative txs of a sub-step are added for scoring (step 4) and
 popped again before the commit, so a reverted tx leaves no trace in it
-either. ``env.acct`` accumulates what the §10 health checks need.
+either. ``env.acct`` accumulates what the §10 health checks need, in BTC:
+the launderers' proceeds, what they cashed out undetected, everything frozen
+in their txs (``frozen``; a flagged setup freezes its change to the source
+too, which ``frozen_change`` holds), and their fees. With the launderers'
+spendable balance (:meth:`SimEnv.launderer_held`) these close:
+``proceeds = cashed + frozen + fees + held``.
 
 Rewards (§9.3, magnitudes ours):
 
 - launderer: ``(cashed out undetected - tranche funds frozen) / tranche``
-  per sub-step, ``-0.001`` per sub-step while it holds funds;
+  per sub-step, ``-0.001`` per sub-step while it holds funds. The frozen
+  change of a flagged setup is not in this reward;
 - innocent: ``+0.1`` when its decision's tx commits (a flagged tx is blocked);
   a forward route's scripted hop 2 earns its ``+0.1`` in ``continuation_rewards``.
 
@@ -146,8 +152,10 @@ class SimEnv:
         self.episode, self.sub, self.g = 0, 0, 0
         self.deposit: dict[tuple[int, int, int], int] = {}   # (role, owner, service) -> deposit address
         self.graph = None      # optional LiveGraph (M5)
-        # health accounting (§10): launderer BTC received / cashed out undetected / frozen, tranches per strategy
-        self.acct = {"proceeds": 0.0, "cashed": 0.0, "frozen": 0.0, "strategy": np.zeros(len(STRATEGIES), np.int64)}
+        # health accounting (§10), launderer BTC: received, cashed out undetected, frozen (all outputs of their
+        # flagged txs, change included), of which change, and fees; tranches per strategy
+        self.acct = {"proceeds": 0.0, "cashed": 0.0, "frozen": 0.0, "frozen_change": 0.0, "fees": 0.0,
+                     "strategy": np.zeros(len(STRATEGIES), np.int64)}
         self._build()
 
     # ------------------------------------------------------------------ world
@@ -228,6 +236,12 @@ class SimEnv:
     def funds(self, L: Launderer) -> float:
         held = [L.source] + (L.tranche.holders if L.tranche else [])
         return sum(self.ledger.balance[a] for a in dict.fromkeys(held))
+
+    def launderer_held(self) -> float:
+        """Spendable BTC at all launderer addresses (sources and mules): the proceeds not yet cashed out, frozen or
+        paid as fees."""
+        bal = np.asarray(self.ledger.balance)
+        return float(bal[np.asarray(self.ledger.addr_role) == ROLE_LAUNDERER].sum())
 
     # ------------------------------------------------------------------ state
     def _refresh_state(self):
@@ -502,17 +516,24 @@ class SimEnv:
 
     # ------------------------------------------------------------------ outcomes
     def _tranche_flows(self, L: Launderer, pr: Proposal) -> tuple[list[int], float, float]:
-        """(next holders, BTC cashed out undetected, tranche BTC frozen) of a launderer proposal."""
-        nxt, cash, frozen = [], 0.0, 0.0
+        """(next holders, BTC cashed out undetected, tranche BTC frozen) of a launderer proposal.
+
+        ``acct`` gets everything a flagged tx froze, its change to the source included (a frozen tx freezes all
+        of its outputs); the returned tranche figure, which the reward uses, leaves that change out.
+        """
+        nxt, cash, frozen, frozen_change = [], 0.0, 0.0, 0.0
         for r, out in zip(pr.resolved, pr.outcomes):
             change = {L.source, r.spec.meta.get("new_source", -1)}
+            self.acct["fees"] += r.fee
             if out == "committed":
                 nxt += r.spec.meta["next"]
                 cash += sum(a for x, a in r.outputs if x == r.spec.meta["cash"])
             else:
                 frozen += sum(a for x, a in r.outputs if x not in change)
+                frozen_change += sum(a for x, a in r.outputs if x in change)
         self.acct["cashed"] += cash
-        self.acct["frozen"] += frozen
+        self.acct["frozen"] += frozen + frozen_change
+        self.acct["frozen_change"] += frozen_change
         return list(dict.fromkeys(nxt)), cash, frozen
 
     def _on_setup(self, pr: Proposal):

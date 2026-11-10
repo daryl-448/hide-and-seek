@@ -81,6 +81,23 @@ def read_records(path: Path) -> list[tuple[str, dict]]:
     return out
 
 
+def btc_fractions(env) -> dict[str, float]:
+    """Where the world's launderer proceeds went, as fractions of the proceeds (§10 health).
+
+    ``success_frac``: cashed out undetected. ``frozen_frac``: everything frozen in launderer txs, a flagged
+    setup's change to the source included (the M5 runs of 2026-11-10 left that change out of ``frozen_frac``).
+    ``frozen_change_frac``: that change alone. ``fee_frac``: fees paid. ``held_frac``: still spendable at
+    launderer addresses at world end. ``btc_utility``: ``success_frac - frozen_frac``. ``accounting_gap``:
+    ``1 - (cashed + frozen + fees + held) / proceeds``, zero up to rounding.
+    """
+    a = env.acct
+    p = max(a["proceeds"], 1e-12)
+    held = env.launderer_held()
+    return {"success_frac": a["cashed"] / p, "frozen_frac": a["frozen"] / p, "frozen_change_frac": a["frozen_change"] / p,
+            "fee_frac": a["fees"] / p, "held_frac": held / p, "btc_utility": (a["cashed"] - a["frozen"]) / p,
+            "accounting_gap": 1.0 - (a["cashed"] + a["frozen"] + a["fees"] + held) / p}
+
+
 def degenerate(epochs: list[dict], window: int = DEGENERATE_WINDOW) -> list[str]:
     """Which health series are stuck above 0.95 or below 0.05 over the last ``window`` epochs (§10)."""
     out = []
@@ -108,13 +125,14 @@ class _AgentPolicy:
         ids = list(states)
         ob = _OBS[self.role](env, tr.fz, ids, tr.gvec, tr.view_seed(self.salt), tr.cfg.k2)
         masks, active = pack_masks(self.role, states, ids)
-        a = sample_actions(L.q_values(ob, masks), L.sizes, tr.cfg.tau, tr.eps, tr.rng)
-        for j, (i, o) in enumerate(zip(ids, ob.split())):
-            oid = L.buf.add(o, masks[j], active[j])
-            prev = L.tail.get(i)
-            if prev is not None:
-                L.buf.link(prev, oid)        # the agent's previous transition now has its next state
-            L.tail[i] = oid
+        a = sample_actions(L.q_values(ob, masks), L.sizes, tr.cfg.tau, tr.eps_for(self.role), tr.rng)
+        if self.role in tr.learn:
+            for j, (i, o) in enumerate(zip(ids, ob.split())):
+                oid = L.buf.add(o, masks[j], active[j], tr.step_no)
+                prev = L.tail.get(i)
+                if prev is not None:
+                    L.buf.link(prev, oid)        # the agent's previous transition now has its next state
+                L.tail[i] = oid
         names = list(L.branches)
         return {i: {b: int(a[j, bi]) for bi, b in enumerate(names) if b in states[i].branches}
                 for j, i in enumerate(ids)}
@@ -134,8 +152,9 @@ class _DetectorPolicy:
     def act_global(self, env, state) -> dict:
         tr, D = self.tr, self.tr.det
         tr.gvec = world_readout(env, tr.last)
-        a = sample_actions(D.global_q(tr.gvec), D.gq.sizes, D.g_tau, tr.eps, tr.rng)[0]
-        D.gbuf.add(tr.gvec, a)
+        a = sample_actions(D.global_q(tr.gvec), D.gq.sizes, D.g_tau, tr.eps_for("detector"), tr.rng)[0]
+        if "detector" in tr.learn:
+            D.gbuf.add(tr.gvec, a)
         self.depth = int(a[0]) + 1
         return {"analysis_depth": int(a[0]), "update_strategy": int(a[1])}
 
@@ -150,17 +169,28 @@ class _DetectorPolicy:
                           cfg.obs_cap)
         margin = D.flag_margin(ob)
         rank = (np.argsort(np.argsort(margin, kind="stable"), kind="stable") + tr.rng.random(n)) / n
-        score = np.where(tr.rng.random(n) < tr.eps, tr.rng.random(n), rank)
-        ones, act = np.ones(2, bool), np.ones(1, bool)
-        self.cand_ids = [D.flag_buf.add(o, ones, act) for o in ob.split()]
+        score = np.where(tr.rng.random(n) < tr.eps_for("detector"), tr.rng.random(n), rank)
+        if "detector" in tr.learn:
+            ones, act = np.ones(2, bool), np.ones(1, bool)
+            self.cand_ids = [D.flag_buf.add(o, ones, act, tr.step_no) for o in ob.split()]
         return score
 
 
+ROLES = ("launderer", "innocent", "detector")
+
+
 class Trainer:
+    """The MARL loop. ``learn``: the roles that store transitions and update (all three in M5); a role outside it
+    acts with its current networks at the fixed epsilon ``fixed_eps[role]`` and is never updated (frozen-opponent
+    diagnostics, ``hns.marl.capability``). A frozen detector also skips detector-W and the world export."""
+
     def __init__(self, cfg: MarlConfig, device, centre: WorldParams, stats_t: dict, norm_w: Normalizer,
                  real_t: RealViews | None = None, real_w: RealViews | None = None, out: Path | None = None,
-                 log=print):
+                 log=print, learn=ROLES, fixed_eps: dict | None = None):
         self.cfg, self.device, self.centre, self.norm_w, self.out, self.log = cfg, device, centre, norm_w, out, log
+        self.learn, self.fixed_eps = frozenset(learn), dict(fixed_eps or {})
+        if not self.learn <= set(ROLES) or any(r not in self.fixed_eps for r in ROLES if r not in self.learn):
+            raise ValueError("every frozen role needs a fixed epsilon")
         torch.manual_seed(cfg.seed)
         self.fz = Featurizer(stats_t)
         self.roles = {r: RoleLearner(r, cfg, device) for r in ("launderer", "innocent")}
@@ -179,6 +209,10 @@ class Trainer:
         c = self.cfg
         return max(c.eps_end, c.eps_start - (c.eps_start - c.eps_end) * self.episode / c.eps_episodes)
 
+    def eps_for(self, role: str) -> float:
+        """A role's exploration rate: fixed if the role is given one, else the schedule."""
+        return self.fixed_eps.get(role, self.eps)
+
     def view_seed(self, salt: int) -> int:
         return (self.cfg.seed * 1_000_003 + self.step_no) * 16 + salt
 
@@ -186,24 +220,29 @@ class Trainer:
     def after_step(self, env, res, ep: dict) -> None:
         """Turn the step's outcome into transitions, labelled source txs and health counts."""
         for tr in res.transitions:
-            L = self.roles[tr.role]
-            L.buf.set(L.tail[tr.agent], [tr.action.get(b, 0) for b in L.branches],
-                      [b in tr.realized for b in L.branches], tr.reward)
+            if tr.role in self.learn:
+                L = self.roles[tr.role]
+                L.buf.set(L.tail[tr.agent], [tr.action.get(b, 0) for b in L.branches],
+                          [b in tr.realized for b in L.branches], tr.reward)
             ep[f"r_{tr.role}"] += tr.reward
         inn = self.roles["innocent"]
         for i, r in res.continuation_rewards.items():
-            if i in inn.tail:
-                inn.buf.add_reward(inn.tail[i], r)   # the forward route's hop 2 pays the decision that chose it
+            if "innocent" in self.learn and i in inn.tail:
+                # the forward route's hop 2 pays the decision that chose it, discounted to the decision's sub-step
+                j = inn.tail[i]
+                inn.buf.add_reward(j, r * self.cfg.gamma ** (self.step_no - inn.buf.t_of(j)))
             ep["r_innocent"] += r
         D, dpol, led = self.det, self.policies[2], env.ledger
-        depth, fb = dpol.depth, self.det.flag_buf
+        depth, fb, d_learn = dpol.depth, self.det.flag_buf, "detector" in self.learn
         lab_t, lab_y = [], []
         n_flag = n_frozen = n_commit = 0
-        for oid, c in zip(dpol.cand_ids, res.candidates):
+        for j, c in enumerate(res.candidates):
             f, ill = c["flagged"], c["illicit"]
-            r = ((1.0 if ill else -0.1) - 0.01 * depth) if f else (-1.0 if c["cashout"] else 0.0)
-            fb.set(oid, (int(f),), (True,), r)
-            fb.end(oid)                              # a flag's outcome is known at once: terminal
+            if d_learn:
+                r = ((1.0 if ill else -0.1) - 0.01 * depth) if f else (-1.0 if c["cashout"] else 0.0)
+                oid = dpol.cand_ids[j]
+                fb.set(oid, (int(f),), (True,), r)
+                fb.end(oid)                          # a flag's outcome is known at once: terminal
             n_flag += f
             n_frozen += f and ill
             ep["cash"] += c["cashout"]
@@ -216,8 +255,9 @@ class Trainer:
                 if cls != UNKNOWN:
                     lab_t.append(tid)
                     lab_y.append(cls == ILLICIT)
-        D.pool.add(lab_t, lab_y)
-        D.gbuf.set_reward(res.detector_reward)
+        if d_learn:
+            D.pool.add(lab_t, lab_y)
+            D.gbuf.set_reward(res.detector_reward)
         ep["r_detector"] += res.detector_reward
         ep["n_cand"] += len(res.candidates)
         ep["n_flag"] += n_flag
@@ -232,13 +272,17 @@ class Trainer:
                      "episode_committed": ep["n_commit"], "depth": depth}
 
     def update(self, losses: dict) -> None:
-        """One gradient step per role (after its warm-up)."""
+        """One gradient step per learning role (after its warm-up)."""
         for name, L in self.roles.items():
+            if name not in self.learn:
+                continue
             t0 = time.perf_counter()
             v = L.update(self.rng)
             self.sec[f"update_{name}"] += time.perf_counter() - t0
             if v is not None:
                 losses[f"td_{name}"].append(v)
+        if "detector" not in self.learn:
+            return
         t0 = time.perf_counter()
         d = self.det.update(self.rng, self.view_seed(4))
         self.sec["update_detector_t"] += time.perf_counter() - t0
@@ -260,6 +304,8 @@ class Trainer:
         for e in range(EPISODES):
             self.episode = w * EPISODES + e
             env.start_episode(e)
+            if self.last:
+                self.last["episode_committed"] = 0       # a new episode has committed nothing yet
             ep = defaultdict(float)
             for _ in range(SUBSTEPS):
                 t0 = time.perf_counter()
@@ -278,17 +324,20 @@ class Trainer:
             for k, v in ep.items():
                 tot[k] += v
         # world end: terminal transitions, then detector-W on the pruned export (§10)
-        for L in self.roles.values():
-            L.end_world()
-        self.det.gbuf.end()
-        t0 = time.perf_counter()
-        n_w = self.det.n_updates - u0
-        sim = SimW(export_world(env), self.norm_w, cfg, env_seed, params.mask_rate)
-        if sim.n:
-            for j in range(n_w):
-                for k, v in self.det.update_w(sim, self.rng, self.view_seed(5) + 16 * j).items():
-                    losses[f"w_{k}"].append(v)
-        self.sec["detector_w"] += time.perf_counter() - t0
+        for name, L in self.roles.items():
+            if name in self.learn:
+                L.end_world()
+        sim = None
+        if "detector" in self.learn:
+            self.det.gbuf.end()
+            t0 = time.perf_counter()
+            n_w = self.det.n_updates - u0
+            sim = SimW(export_world(env), self.norm_w, cfg, env_seed, params.mask_rate)
+            if sim.n:
+                for j in range(n_w):
+                    for k, v in self.det.update_w(sim, self.rng, self.view_seed(5) + 16 * j).items():
+                        losses[f"w_{k}"].append(v)
+            self.sec["detector_w"] += time.perf_counter() - t0
         mean = {k: float(np.mean(v)) for k, v in losses.items()}
         bad = [k for k, v in mean.items() if not math.isfinite(v)]
         if bad:
@@ -302,8 +351,7 @@ class Trainer:
                        "detector": tot["r_detector"] / EPISODES},
             "detection_rate": tot["cash_flag"] / max(tot["cash"], 1.0),
             "illicit_licit_ratio": float(np.mean(ratio)),
-            "success_frac": a["cashed"] / max(a["proceeds"], 1e-12),
-            "frozen_frac": a["frozen"] / max(a["proceeds"], 1e-12),
+            **btc_fractions(env),
             "strategy_share": {s: (int(c) / started if started else 0.0) for s, c in zip(STRATEGIES, a["strategy"])},
             "tranches": started, "flag_precision": tot["n_frozen"] / max(tot["n_flag"], 1.0),
             "flag_share": tot["n_flag"] / max(tot["n_cand"], 1.0), "budget_mean": tot["budget"] / n_sub,
@@ -311,7 +359,7 @@ class Trainer:
             "n_tx": int(tot["n_commit"]), "n_illicit": int(tot["illicit"]), "n_cashout": int(tot["cash"]),
             "world_params": {"n_launderers": params.n_launderers, "budget": params.budget,
                              "mask_rate": params.mask_rate, "offset": params.offset, "n_innocents": params.n_innocents},
-            "export": {"n_tx": sim.n_tx, "n_labelled_wallets": sim.n},
+            "export": {"n_tx": sim.n_tx, "n_labelled_wallets": sim.n} if sim is not None else None,
             "losses": mean,
             "updates": {"launderer": self.roles["launderer"].n_updates, "innocent": self.roles["innocent"].n_updates,
                         "detector_t": self.det.n_updates, "detector_w": self.det.n_w_updates},
@@ -337,6 +385,17 @@ class Trainer:
         return {"launderer": self.roles["launderer"].net, "launderer_targ": self.roles["launderer"].targ,
                 "innocent": self.roles["innocent"].net, "innocent_targ": self.roles["innocent"].targ,
                 "det_t": D.det_t, "det_w": D.det_w, "gq": D.gq, "gq_targ": D.gq_targ}
+
+    def load_models(self, path: Path, roles) -> None:
+        """Load the networks of ``roles`` (and their target networks) from a checkpoint's ``models``: another run's
+        trained opponents, for a frozen-opponent diagnostic. Optimizers and buffers are left alone."""
+        keys = {"launderer": ("launderer", "launderer_targ"), "innocent": ("innocent", "innocent_targ"),
+                "detector": ("det_t", "det_w", "gq", "gq_targ")}
+        ck = torch.load(path, map_location=self.device, weights_only=False)
+        mods = self._models()
+        for r in roles:
+            for k in keys[r]:
+                mods[k].load_state_dict(ck["models"][k])
 
     def _opts(self) -> dict:
         return {"launderer": self.roles["launderer"].opt, "innocent": self.roles["innocent"].opt,

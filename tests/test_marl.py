@@ -16,7 +16,7 @@ from hns.marl.obs import (BRANCHES, D_CAND, I_CTRL, L_CTRL, Featurizer, ObsBatch
                           innocent_obs, launderer_obs, pack_masks, world_readout)
 from hns.models.detector import Detector, Graph, kl_normal, target_rows
 from hns.models.hrg import Views
-from hns.models.qnet import AgentQ, BranchHeads, sample_actions, soft_value, td_loss
+from hns.models.qnet import AgentQ, BranchHeads, root_value, sample_actions, soft_value, td_loss
 from hns.sim.entities import K_RECIPIENTS
 from hns.sim.env import SimEnv
 from hns.sim.live import KIND_CTRL, KIND_TX, KIND_W, LiveGraph
@@ -273,7 +273,7 @@ class _FakeW(_FakeT):
         return v, {"x_tx": np.zeros((0, 17), np.float32), "x_w": np.ones((n, 58), np.float32)}
 
 
-def _trainer(tmp_path, monkeypatch, arm, episodes=4, **kw):
+def _trainer(tmp_path, monkeypatch, arm, episodes=4, learn=mt.ROLES, fixed_eps=None, out_name=None, **kw):
     monkeypatch.setattr(mt, "EPISODES", 2)
     monkeypatch.setattr(mt, "SUBSTEPS", 12)
     monkeypatch.setattr(mt, "draw_world", lambda c, rng: replace(c, mask_rate=0.2, offset=int(rng.integers(0, 40))))
@@ -284,9 +284,10 @@ def _trainer(tmp_path, monkeypatch, arm, episodes=4, **kw):
         ft, fw = _FakeT(), _FakeW()
         real_t = RealViews.task_t(ft)
         real_w = RealViews(fw, 50 + np.arange(20), np.full(20, -1))
-    out = tmp_path / arm
+    out = tmp_path / (out_name or arm)
     out.mkdir(exist_ok=True)
-    return mt.Trainer(cfg, torch.device("cpu"), TINY, st, Normalizer(st), real_t, real_w, out, log=lambda *_: None)
+    return mt.Trainer(cfg, torch.device("cpu"), TINY, st, Normalizer(st), real_t, real_w, out, log=lambda *_: None,
+                      learn=learn, fixed_eps=fixed_eps)
 
 
 def test_nda_run_transitions_health_and_resume(tmp_path, monkeypatch):
@@ -303,6 +304,9 @@ def test_nda_run_transitions_health_and_resume(tmp_path, monkeypatch):
     assert not any(k.endswith(("kl_d", "dom", "kl_sn", "rec")) for k in e["losses"])       # NDA: no L_aux
     assert 0 <= e["detection_rate"] <= 1 and 0 <= e["success_frac"] <= 1 and e["degenerate"] == []
     assert math.isclose(sum(e["strategy_share"].values()), 1.0, rel_tol=1e-9)
+    # where the proceeds went closes: cashed + frozen (change included) + fees + held
+    assert abs(e["accounting_gap"]) < 1e-9 and 0 <= e["frozen_change_frac"] <= e["frozen_frac"]
+    assert math.isclose(e["btc_utility"], e["success_frac"] - e["frozen_frac"], abs_tol=1e-12)
     # flag transitions: terminal, reward from the flag's outcome at the depth used
     fb = tr.det.flag_buf
     n = min(fb.n, fb.cap)
@@ -453,6 +457,190 @@ def test_report_places_findings_after_acceptance_and_draws_the_figures(tmp_path,
     (tr.out / "metrics.jsonl").write_text(first + "\n")          # and neither does a report of pending runs only
     assert not report.write(tmp_path / "runs", tmp_path / "m5.md", tmp_path / "figs", notes)
     assert all((tmp_path / "figs" / f"m5_{n}.png").stat().st_size > 10_000 for n in ("health", "strategy", "losses"))
+
+
+# ---------------------------------------------------------------------------- learner fixes after M5 (2026-11-10)
+def test_root_value_reads_the_initiate_branch_only():
+    sizes, tau = [2, 3], 0.5
+    q = torch.tensor([[1.0, 2.0, 50.0, 0.0, 9.0], [0.5, NEG, 7.0, 7.0, 7.0]])
+    want = torch.tensor([tau * math.log(math.exp(1 / tau) + math.exp(2 / tau)), 0.5])   # go infeasible: wait only
+    assert torch.allclose(root_value(q, sizes, tau), want, atol=1e-6)
+    q2 = q.clone()
+    q2[:, 2:] += 100.0                                        # the launch branches do not enter the target
+    assert torch.equal(root_value(q2, sizes, tau), root_value(q, sizes, tau))
+    assert not torch.allclose(soft_value(q2, sizes, torch.ones(2, 2, dtype=torch.bool), tau),
+                              soft_value(q, sizes, torch.ones(2, 2, dtype=torch.bool), tau))
+
+
+def test_replay_records_the_sub_steps_a_transition_spans():
+    buf = Replay(10, [2])
+    ones = np.ones(2, bool), np.ones(1, bool)
+    a = buf.add("s0", *ones, t=3)
+    b = buf.add("s1", *ones, t=53)
+    buf.set(a, [0], [True], 1.0)
+    buf.link(a, b)
+    buf.set(b, [1], [True], 0.0)
+    buf.end(b)
+    assert buf.t_of(a) == 3 and buf.t_of(b) == 53
+    s = buf.sample(40, np.random.default_rng(0))
+    assert (~s["done"]).sum() == len(s["gap"]) > 0 and (s["gap"] == 50).all()
+
+
+@pytest.mark.parametrize("target", ["root", "mean"])
+def test_role_targets_bootstrap_their_branches_at_gamma_per_sub_step(tmp_path, monkeypatch, target):
+    from hns.marl import learner as lm
+
+    tr = _trainer(tmp_path, monkeypatch, "nda", episodes=2, target=target)
+    tr.run()
+    seen = {}
+
+    def fake_td(q, sizes, action, realized, y):
+        seen["y"] = y.detach().clone()
+        return (torch.where(torch.isfinite(q), q, torch.zeros_like(q)) * 0.0).sum()
+
+    monkeypatch.setattr(lm, "td_loss", fake_td)
+    cfg, spans = tr.cfg, 0
+    for role in ("launderer", "innocent"):
+        L = tr.roles[role]
+        for seed in range(40):
+            b = L.buf.sample(cfg.batch, np.random.default_rng(seed))     # the batch update() is about to draw
+            y = torch.from_numpy(b["reward"]).clone()
+            live = ~b["done"]
+            if live.any():
+                with torch.no_grad():
+                    q2 = L._q(L.targ, collate(b["next_obs"]), b["next_masks"])
+                f = (root_value(q2, L.sizes, cfg.tau) if target == "root"
+                     else soft_value(q2, L.sizes, torch.from_numpy(b["next_active"]), cfg.tau))
+                y[torch.from_numpy(live)] += torch.from_numpy(cfg.gamma ** b["gap"].astype(np.float64)).float() * f
+                spans += int((b["gap"] > 1).sum())
+            L.update(np.random.default_rng(seed))
+            assert torch.allclose(seen["y"], y, atol=1e-5), (role, seed)
+    assert spans > 0                                          # some transitions spanned more than one sub-step
+
+
+def test_innocent_continuation_reward_is_discounted_to_the_decision(tmp_path, monkeypatch):
+    tr = _trainer(tmp_path, monkeypatch, "nda", episodes=2)
+    tr.run()
+    buf = tr.roles["innocent"].buf
+    r = buf.reward[:min(buf.n, buf.cap)].astype(np.float64)
+    plain = np.isclose(r, 0.0, atol=1e-7) | np.isclose(r, 0.1, atol=1e-7)
+    forward = (r > 0.1 + 1e-5) & (r < 0.1 + 0.1 * tr.cfg.gamma + 1e-6)      # 0.1 + 0.1 gamma^delta, delta >= 1
+    assert (plain | forward).all() and forward.any()
+
+
+def test_readout_commit_count_restarts_with_each_episode(tmp_path, monkeypatch):
+    seen, real = [], mt.world_readout
+
+    def spy(env, last):
+        seen.append((env.episode, env.sub, last.get("episode_committed")))
+        return real(env, last)
+
+    monkeypatch.setattr(mt, "world_readout", spy)
+    _trainer(tmp_path, monkeypatch, "nda", episodes=2).run()
+    firsts = [c for e, s, c in seen if s == 0 and e > 0]
+    assert firsts and all(c == 0 for c in firsts) and any(c for _, s, c in seen if s > 0)
+
+
+class _OneDirect:
+    """Launderer 0 launches one ``direct`` tranche at ``amount`` at its first idle decision; everyone else waits."""
+
+    def __init__(self, amount, change):
+        self.amount, self.change, self.done = amount, change, False
+
+    def act(self, env, states):
+        from hns.sim.entities import AMOUNTS, GO, STRATEGIES, WAIT
+        out = {}
+        for i, st in states.items():
+            a = {b: int(np.flatnonzero(st.masks[b])[0]) for b in st.branches}
+            a["initiate"] = WAIT
+            if i == 0 and not self.done and len(st.branches) == 6:
+                a.update(initiate=GO, amount=AMOUNTS.index(self.amount), strategy=STRATEGIES.index("direct"),
+                         change=self.change)
+                self.done = True
+            out[i] = a
+        return out
+
+
+class _FlagIllicit:
+    def act_global(self, env, state):
+        return {"analysis_depth": 0, "update_strategy": 1}
+
+    def score(self, env, cands):
+        return np.array([float(r.spec.illicit) for r in cands])
+
+
+@pytest.mark.parametrize("amount,change", [(0.1, 1), (0.1, 0), (1.0, 1)])
+def test_a_flagged_setup_freezes_its_change_and_the_btc_accounting_closes(amount, change):
+    env = SimEnv(TINY, 5, launderers=_OneDirect(amount, change), detector=_FlagIllicit())
+    env.start_episode(0)
+    env.budget = 1.0                                          # every candidate is flagged: illicit ones freeze
+    L = env.launderers[0]
+    bal0 = env.ledger.balance[L.source]
+    res = env.step()
+    tr = next(t for t in res.transitions if t.role == "launderer" and t.agent == 0)
+    a = env.acct
+    assert tr.realized[0] == "initiate" and len(tr.realized) >= 4
+    lost = bal0 - a["fees"]                                   # the whole source, less the setup's fee
+    assert math.isclose(a["frozen"], lost, rel_tol=1e-12) and a["cashed"] == 0.0
+    assert math.isclose(a["frozen_change"], (1.0 - amount) * lost, rel_tol=1e-9, abs_tol=1e-15)
+    assert math.isclose(tr.reward, -1.0, rel_tol=1e-9)        # the per-tranche reward still ignores the change
+    f = mt.btc_fractions(env)
+    assert abs(f["accounting_gap"]) < 1e-12 and math.isclose(f["frozen_frac"], lost / a["proceeds"], rel_tol=1e-12)
+
+
+def test_btc_accounting_closes_over_a_static_world():
+    env = SimEnv(replace(TINY, budget=0.2), 11)
+    env.run_world()
+    f = mt.btc_fractions(env)
+    assert abs(f["accounting_gap"]) < 1e-9 and f["frozen_change_frac"] > 0 and f["success_frac"] > 0
+    assert f["held_frac"] >= 0 and f["fee_frac"] > 0
+
+
+def test_frozen_roles_act_but_neither_store_nor_update(tmp_path, monkeypatch):
+    src = _trainer(tmp_path, monkeypatch, "nda", episodes=2)
+    src.run()
+    final = tmp_path / "nda" / "ckpt" / "final.pt"
+    with pytest.raises(ValueError):                           # a frozen role needs a fixed epsilon
+        _trainer(tmp_path, monkeypatch, "nda", learn=("launderer",), fixed_eps={"innocent": 0.05}, out_name="x")
+    tr = _trainer(tmp_path, monkeypatch, "nda", episodes=2, learn=("launderer",),
+                  fixed_eps={"innocent": 0.05, "detector": 0.0}, out_name="frozen")
+    tr.load_models(final, ("innocent", "detector"))
+    ck = torch.load(final, weights_only=False)["models"]
+    assert all(torch.equal(ck["det_t"][k], v) for k, v in tr.det.det_t.state_dict().items())
+    assert tr.eps_for("innocent") == 0.05 and tr.eps_for("detector") == 0.0 and tr.eps_for("launderer") == tr.eps
+    rec = tr.run_world()
+    assert rec["updates"]["launderer"] > 0 and rec["updates"]["innocent"] == 0 == rec["updates"]["detector_t"]
+    assert rec["updates"]["detector_w"] == 0 and rec["export"] is None
+    assert tr.roles["innocent"].buf.n == 0 and tr.det.flag_buf.n == 0 and tr.det.gbuf.n == 0
+    assert all(torch.equal(ck["det_t"][k], v) for k, v in tr.det.det_t.state_dict().items())
+    assert all(torch.equal(ck["innocent"][k], v) for k, v in tr.roles["innocent"].net.state_dict().items())
+    assert rec["n_tx"] > 0 and abs(rec["accounting_gap"]) < 1e-9 and 0 <= rec["detection_rate"] <= 1
+
+
+def test_scheduled_references_launch_once_per_episode():
+    from hns.marl.capability import Scheduled
+    from hns.sim.entities import AMOUNTS, STRATEGIES
+
+    for never, want in ((False, TINY.n_launderers), (True, 0)):
+        env = SimEnv(TINY, 2, launderers=Scheduled(np.random.default_rng(0), STRATEGIES.index("direct"),
+                                                   AMOUNTS.index(0.5), never=never))
+        for e in range(2):
+            env.start_episode(e)
+            n0 = env.acct["strategy"].copy()
+            for _ in range(50):
+                env.step()
+            d = env.acct["strategy"] - n0
+            assert d.sum() == want and d[STRATEGIES.index("direct")] == want
+
+
+def test_capability_calibration_discounts_per_sub_step_to_world_end():
+    from hns.marl.capability import calibration
+
+    dec = [(10, 7, 1, 1.0, 2.0), (0, 7, 0, -0.001, 1.0), (3, 8, 0, 0.5, None)]   # (step, agent, a0, r, Q)
+    c = calibration(dec, 0.9)
+    g = np.array([-0.001 + 0.9 ** 10 * 1.0, 1.0])
+    assert c["q_n"] == 2 and math.isclose(c["q_bias"], float(np.mean(np.array([1.0, 2.0]) - g)), rel_tol=1e-12)
+    assert math.isclose(c["g_abs_mean"], float(np.abs(g).mean()), rel_tol=1e-12) and c["q_max"] == 2.0
 
 
 def test_kind_values_agree():

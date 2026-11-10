@@ -11,7 +11,9 @@ train:                  # MarlConfig fields
   tau: 0.01             # ENTROPY_COEF, used as the soft-Q temperature (G7)
   batch: 128
   clip: 1.0
-  dropout: 0.5
+  dropout: 0.5          # the detectors' GAT (paper)
+  q_dropout: 0.5        # ours: the launderer and innocent Q-networks
+  target: root          # ours: launderers and innocents bootstrap through initiate only (mean: SPEC §10 as first written)
   beta: 0.01
   lam: 0.1              # lambda_MARL: preset, chosen without real labels (§8.4)
   fgsm_eps: 0.1

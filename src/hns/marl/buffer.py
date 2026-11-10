@@ -2,11 +2,14 @@
 
 A transition is ``(s, a, R(s, a), r, s', d)``. Each agent's states form a
 chain, so a buffer stores every observation once: entry ``i`` holds ``s``,
-the branch set and masks of ``s``, the action and its realized branches,
-the reward, and ``nxt``, the id of the entry that holds ``s'`` (the same
-agent's next decision point). ``nxt`` is ``PENDING`` until that next state
-arrives, and ``TERMINAL`` when the world ends first (``d = 1``), or at once
-for a transition that is always terminal (the inspector's per-tx flags).
+the branch set and masks of ``s``, the sub-step ``t`` at which ``s`` was
+observed, the action and its realized branches, the reward, and ``nxt``,
+the id of the entry that holds ``s'`` (the same agent's next decision
+point). ``nxt`` is ``PENDING`` until that next state arrives, and
+``TERMINAL`` when the world ends first (``d = 1``), or at once for a
+transition that is always terminal (the inspector's per-tx flags). A sampled
+transition's ``gap`` is ``t(s') - t(s)``, the sub-steps it spans, so the
+target can discount by ``gamma ** gap`` (§10).
 
 Ids count up forever; the ring keeps the newest ``capacity`` entries. A
 later entry is always newer, so the next state of a live entry is live too.
@@ -34,17 +37,22 @@ class Replay:
         self.realized = np.zeros((capacity, nb), bool)
         self.reward = np.zeros(capacity, np.float32)
         self.nxt = np.full(capacity, PENDING, np.int64)
+        self.t = np.zeros(capacity, np.int64)
 
     def alive(self, i: int) -> bool:
         return 0 <= i < self.n and i >= self.n - self.cap
 
-    def add(self, obs, masks: np.ndarray, active: np.ndarray) -> int:
-        """Store a state; returns its id. Its transition is filled in by :meth:`set` and :meth:`link`/:meth:`end`."""
+    def add(self, obs, masks: np.ndarray, active: np.ndarray, t: int = 0) -> int:
+        """Store a state observed at sub-step ``t``; returns its id. Its transition is filled in by :meth:`set` and
+        :meth:`link`/:meth:`end`."""
         i, s = self.n, self.n % self.cap
-        self.obs[s], self.masks[s], self.active[s] = obs, masks, active
+        self.obs[s], self.masks[s], self.active[s], self.t[s] = obs, masks, active, t
         self.realized[s], self.reward[s], self.nxt[s] = False, 0.0, PENDING
         self.n += 1
         return i
+
+    def t_of(self, i: int) -> int:
+        return int(self.t[i % self.cap])
 
     def set(self, i: int, action: np.ndarray, realized: np.ndarray, reward: float) -> None:
         if self.alive(i):
@@ -80,7 +88,7 @@ class Replay:
         return {"obs": [self.obs[i] for i in s], "masks": self.masks[s], "active": self.active[s],
                 "action": self.action[s], "realized": self.realized[s], "reward": self.reward[s],
                 "done": ~live, "next_obs": [self.obs[i] for i in ns], "next_masks": self.masks[ns],
-                "next_active": self.active[ns]}
+                "next_active": self.active[ns], "gap": self.t[ns] - self.t[s[live]]}
 
 
 class VecReplay:

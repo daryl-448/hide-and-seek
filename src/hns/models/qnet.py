@@ -19,11 +19,14 @@ attention between the state embedding and each candidate's features.
 The inspector's per-tx ``select_tx`` head lives on the detector itself
 (``Detector.flag_q``).
 
-The soft-Q pieces of §10 are here too: :func:`soft_value` is the shared
-target's ``(1/|B(s')|) sum_b tau logsumexp_a Q_b(s', a) / tau``,
-:func:`td_loss` is the mean squared error over the realized branches
-``R(s, a)``, and :func:`sample_actions` is the behaviour policy
-``softmax(Q_b / tau)`` over ``M_b`` mixed with epsilon-greedy.
+The soft-Q pieces of §10 are here too: :func:`soft_value` is the mean
+target's ``(1/|B(s')|) sum_b tau logsumexp_a Q_b(s', a) / tau`` (the
+inspector's global branches, which are always all realized),
+:func:`root_value` is the root target ``tau logsumexp_a Q_initiate(s', a) /
+tau`` (launderers and innocents), :func:`td_loss` is the mean squared error
+over the realized branches ``R(s, a)``, and :func:`sample_actions` is the
+behaviour policy ``softmax(Q_b / tau)`` over ``M_b`` mixed with
+epsilon-greedy.
 """
 
 from __future__ import annotations
@@ -100,6 +103,16 @@ def soft_value(q: torch.Tensor, sizes: list[int], active: torch.Tensor, tau: flo
     vals = torch.stack([tau * torch.logsumexp(qb / tau, dim=1) for qb in q.split(sizes, dim=1)], dim=1)
     act = active.to(vals.dtype)
     return (vals * act).sum(1) / act.sum(1).clamp_min(1)
+
+
+def root_value(q: torch.Tensor, sizes: list[int], tau: float) -> torch.Tensor:
+    """``tau logsumexp_{a in M_0(s)} Q_0(s, a) / tau`` per row: the soft value of the first (root) branch only.
+
+    For launderers and innocents the root is ``initiate``: it is in ``B(s)`` and realized under every action, so
+    it is the only branch whose values every transition trains. The other branches only rank the options of a
+    launch (§10, ours). Infeasible options are ``-inf`` in ``q`` and drop out.
+    """
+    return tau * torch.logsumexp(q[:, :sizes[0]] / tau, dim=1)
 
 
 def td_loss(q: torch.Tensor, sizes: list[int], action: torch.Tensor, realized: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

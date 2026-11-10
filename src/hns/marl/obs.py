@@ -169,7 +169,8 @@ def world_readout(env, last: dict) -> np.ndarray:
 
     ``last``: the previous sub-step's ``n_cand``, ``n_flag``, ``n_frozen`` and ``depth``, and
     ``episode_committed``, the txs committed so far in the episode. ``Trainer`` refreshes ``last`` after every
-    sub-step, so at an episode's first sub-step ``episode_committed`` still holds the previous episode's total.
+    sub-step and sets ``episode_committed`` to 0 when an episode starts (the M5 runs of 2026-11-10 still saw the
+    previous episode's total at an episode's first sub-step).
     """
     n = max(last.get("n_cand", 0), 1)
     fl = last.get("n_flag", 0)

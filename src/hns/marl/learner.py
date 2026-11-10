@@ -4,12 +4,28 @@
 Q-network per role, shared by the role's agents, trained on the TD loss
 only. Target (one per transition, soft-Q with temperature ``tau``):
 
-    y = r + gamma (1 - d) (1/|B(s')|) sum_{b in B(s')} tau logsumexp_{a in M_b(s')} Q_b^targ(s', a) / tau
+    y = r + gamma ** gap (1 - d) F(s')
+
+with the root target (``target = "root"``, ours)
+
+    F(s') = tau logsumexp_{a in M_initiate(s')} Q_initiate^targ(s', a) / tau,
+
+or the mean target as SPEC §10 first wrote it (``target = "mean"``, kept
+for the M5 diagnosis)
+
+    F(s') = (1/|B(s')|) sum_{b in B(s')} tau logsumexp_{a in M_b(s')} Q_b^targ(s', a) / tau,
 
 and loss ``(1/|R(s,a)|) sum_{b in R(s,a)} (y - Q_b(s, a_b))^2``. ``s'`` is
 the agent's next decision point (ours: a launderer without funds and an
 innocent without a demand have no state, so the chain skips those
-sub-steps without extra discounting). ``d = 1`` only at world end.
+sub-steps), and ``gap`` is the number of sub-steps between ``s`` and ``s'``,
+so ``gamma`` discounts per sub-step. ``d = 1`` only at world end. Why the
+root: when an agent waits, only ``initiate`` is realized, yet the mean
+target bootstraps through all of ``B(s')``, so branches trained only on
+launches carry most of every idle state's target (reports/m5_marl.md).
+
+The role networks have their own dropout, ``q_dropout``: acting and the
+target network run in eval mode, updates in train mode.
 
 **detector-T** (:class:`DetectorLearner`, the acting inspector):
 ``TD + L_DA + lambda_MARL L_adv`` in one gradient step.
@@ -62,7 +78,7 @@ from hns.marl.obs import (BRANCHES, D_CAND, D_W_AGENT, G_DIM, I_CTRL, L_CTRL, Fe
                           detector_obs, merge, with_kind)
 from hns.models.detector import Detector, target_rows
 from hns.models.hrg import N_REL, ViewSampler, build_relations
-from hns.models.qnet import AgentQ, GlobalQ, soft_value, td_loss
+from hns.models.qnet import AgentQ, GlobalQ, root_value, soft_value, td_loss
 from hns.sim.labels import ILLICIT, UNKNOWN
 from hns.sim.live import keep_mask
 from hns.transfer.adv import fgsm
@@ -78,7 +94,9 @@ class MarlConfig:
     tau: float = 0.01            # ENTROPY_COEF, used as the soft-Q temperature
     batch: int = 128
     clip: float = 1.0
-    dropout: float = 0.5
+    dropout: float = 0.5         # the detectors' GAT (paper)
+    q_dropout: float = 0.5       # the launderer and innocent Q-networks (ours)
+    target: str = "root"         # root | mean: the launderer and innocent bootstrap (ours, see above)
     beta: float = 0.01
     lam: float = 0.1             # lambda_MARL, preset (§8.4)
     fgsm_eps: float = 0.1
@@ -100,6 +118,8 @@ class MarlConfig:
     def __post_init__(self):
         if self.arm not in ("full", "nda"):
             raise ValueError(f"unknown arm {self.arm}")
+        if self.target not in ("root", "mean"):
+            raise ValueError(f"unknown target {self.target}")
 
     @property
     def da(self) -> bool:
@@ -136,9 +156,11 @@ class RoleLearner:
     def __init__(self, role: str, cfg: MarlConfig, device):
         self.role, self.cfg, self.device = role, cfg, device
         self.branches = BRANCHES[role]
+        if next(iter(self.branches)) != "initiate":
+            raise ValueError("the root target needs initiate as the first branch")
         ptr = {"recipient": D_CAND} if role == "launderer" else None
         self.net = AgentQ(self.branches, 17, D_W_AGENT, L_CTRL if role == "launderer" else I_CTRL, pointer=ptr,
-                          dropout=cfg.dropout).to(device)
+                          dropout=cfg.q_dropout).to(device)
         self.targ = _target_of(self.net)
         _amp(cfg, self.net.enc, self.targ.enc)
         self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr)
@@ -157,6 +179,12 @@ class RoleLearner:
         self.net.eval()
         return self._q(self.net, ob, masks).cpu().numpy()
 
+    def next_value(self, q2: torch.Tensor, next_active: torch.Tensor) -> torch.Tensor:
+        """``F(s')`` of the configured target, from the target network's ``Q(s', .)``."""
+        if self.cfg.target == "root":
+            return root_value(q2, self.sizes, self.cfg.tau)
+        return soft_value(q2, self.sizes, next_active, self.cfg.tau)
+
     def update(self, rng: np.random.Generator) -> float | None:
         """One TD step on a replay batch; ``None`` during warm-up."""
         cfg, dev = self.cfg, self.device
@@ -167,9 +195,9 @@ class RoleLearner:
         if b["next_obs"]:
             with torch.no_grad():
                 q2 = self._q(self.targ, collate(b["next_obs"]), b["next_masks"])
-                v2 = soft_value(q2, self.sizes, _t(b["next_active"], dev), cfg.tau)
+                v2 = self.next_value(q2, _t(b["next_active"], dev))
             y = y.clone()
-            y[_t(~b["done"], dev)] += cfg.gamma * v2
+            y[_t(~b["done"], dev)] += cfg.gamma ** _t(b["gap"], dev).to(y.dtype) * v2
         self.net.train()
         q = self._q(self.net, collate(b["obs"]), b["masks"])
         loss = td_loss(q, self.sizes, _t(b["action"], dev), _t(b["realized"], dev), y)
