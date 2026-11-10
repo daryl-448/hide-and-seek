@@ -420,9 +420,17 @@ Each agent observes its 2-hop neighbourhood in an **agent-view HRG**: the T-view
 
 | Role | Count per world | Action `[...]` (Eqs. 16–17) | Reward (ours, magnitudes) |
 |---|---|---|---|
-| **Launderer** | `n_L` (multiverse). Each has 1 illicit source address holding the proceeds, plus a mule pool that grows on demand. | `initiate` ∈ {0, 1}, where 0 means wait. `amount` ∈ {10, 25, 50, 100} % of the source balance. `recipient` = a pointer over K = 16 **service** deposit addresses: the tranche's cash-out target. `strategy` ∈ 9 route templates (below), each ≤ 6 hops, executed one hop per sub-step and ending at the recipient. `mules` ∈ {fresh, reuse} for the route's intermediate addresses. `change` ∈ {fresh, reuse}. | `+r_success = 1.0 × (fraction of funds cashed out at a service undetected)`. `−r_detected = 1.0 × (fraction frozen)`. `−0.001` per sub-step while funds remain. |
+| **Launderer** | `n_L` (multiverse). Each has 1 illicit source address holding the proceeds, plus a mule pool that grows on demand. | `initiate` ∈ {0, 1}, where 0 means wait. `amount` ∈ {10, 25, 50, 100} % of the source balance. `recipient` = a pointer over K = 16 **service** deposit addresses: the tranche's cash-out target. `strategy` ∈ 9 route templates (below), each ≤ 6 hops, executed one hop per sub-step and ending at the recipient. `mules` ∈ {fresh, reuse} for the route's intermediate addresses. `change` ∈ {fresh, reuse}. | Per sub-step, `(BTC cashed out at a service undetected − BTC newly frozen) / D_w`: `+r_success` and `−r_detected` measured in BTC, over the world's mean proceeds per launderer and episode `D_w` (below). `−0.001` per sub-step while funds remain. |
 | **Innocent** | 3k–6k individuals per world, each with 1–5 addresses. A scripted demand process makes about 2 % active per sub-step, each with a fixed recipient and amount. | `initiate` ∈ {now, defer}. `amount split` ∈ {1, 2, 3}. `route` ∈ {direct, forward via own second address, via service}. `change` ∈ {fresh, reuse}. The recipient is fixed by demand. | `+r_legit = 0.1` per executed tx. A **flagged (false-positive) tx is blocked for that sub-step** and earns no `r_legit`. This is the indirect false-positive cost that the paper leaves unspecified (G16). |
 | **Detector** | 1 | `select_tx`: flag the top-k of this sub-step's new txs by `Q_flag − Q_skip`. `analysis_depth` ∈ {1, 2} GAT hops (deeper messages are masked). `update_strategy` ∈ {−, 0, +}, which multiplies the budget fraction `b` by {0.8, 1, 1.25} within [1 %, 20 %]. | `+r_detect = 1.0` for each flagged illicit tx. `−r_miss = 1.0` for each unflagged illicit tx that pays a service (cash-out), and 0 for intermediate hops, which can still be caught later. `−r_false = 0.1` for each flagged licit tx. `−0.01 × depth` per investigated tx. |
+
+**Launderer proceeds and reward (ours; revised after M5's first runs).**
+- At world creation, each launderer's proceeds for the world's 10 episodes, `p_{i,e} ∼ lognormal(μ, σ)` (§9.7), are drawn on their own RNG stream. Each is credited to the source at the start of its episode. Future proceeds are in no observation.
+- `P_w = Σ_{i,e} p_{i,e}`, and `D_w = P_w / (10 n_L)` is the world's mean proceeds per launderer and episode. `D_w` is fixed for the world and shared by its launderers.
+- Frozen BTC counts every output of a flagged launderer tx, a setup's change to the source included: a frozen tx freezes all its outputs (step 6 below).
+- Without discounting and the holding cost, the launderers' mean episode reward is then exactly the world's **BTC utility**, `(cashed − frozen) / P_w`. A fixed amount earns the same whether it moves in one tranche or in ten.
+- M5's first runs (2026-11-10) used `(cashed − frozen tranche) / tranche` per hop instead. That pays up to +1 per tranche whatever its size, which rewards splitting, and it ignores frozen change. It stays logged as a diagnostic.
+- Neither form is Eq. 14 verbatim: the paper reports no magnitudes.
 
 **Action execution (feasibility masks `M_b` and templates):**
 - **Branch sets depend only on state.** For each role, the set of active branches `B(s)` and the per-option masks `M_b(s)` are functions of the state, never of the current action. This is what §10's target needs.
@@ -464,7 +472,7 @@ Each agent observes its 2-hop neighbourhood in an **agent-view HRG**: the T-view
 5. **Flag.** The detector flags the top-k.
 6. **Commit or revert.**
    - Unflagged txs commit.
-   - Flagged illicit txs commit with their outputs **frozen**, so the funds are lost to the launderer.
+   - Flagged illicit txs commit with **all** their outputs **frozen**, change included, so the funds are lost to the launderer.
    - Flagged licit txs are **reverted**: their inputs are released, and the demand stays pending and retries later.
 7. **Reward**, then `s_{t+1}` = the committed ledger.
 
@@ -547,7 +555,9 @@ The `size = 10 + 148·n_in + 34·n_out` formula matches the real median `size` w
 | Gap in Algorithm 1 | Our fill |
 |---|---|
 | `max_{a'}` over a structured action | **BDQ, the branching dueling Q-network** (Tavakoli et al. 2018), with per-branch values: `Q_b(s, a_b) = V(s) + A_b(s, a_b) − mean_{a ∈ M_b(s)} A_b(s, a)`, for each branch `b ∈ B(s)`. `B(s)` and `M_b(s)` depend on the state only (§9.3). The pointer branch's `A_b` scores candidates by attention. |
-| ENTROPY_COEF 0.01 matches no equation | It becomes the **soft-Q temperature** `τ = 0.01`. One shared target per transition: `y = r + γ (1 − d) · (1/|B(s')|) Σ_{b ∈ B(s')} τ · logsumexp_{a ∈ M_b(s')} (Q_b^targ(s', a) / τ)`. The next state's branch set `B(s')` is fixed by `s'` alone, so no next-step action is needed. The loss is `(1/|R(s,a)|) Σ_{b ∈ R(s,a)} (y − Q_b(s, a_b))²`, the BDQ form with mean aggregation over the branches whose choice took effect (§9.3). The behaviour policy is softmax(Q_b / τ) per branch over `M_b`, combined with ε-greedy that decays from 1.0 to 0.05 over the first 300 episodes. As τ → 0 this is Algorithm 1's max. |
+| ENTROPY_COEF 0.01 matches no equation | It becomes the **soft-Q temperature** `τ = 0.01`. One shared target per transition: `y = r + γ^Δ (1 − d) · F(s')`, where `s'` is the agent's next decision point and `Δ` the number of sub-steps to it, so γ is per sub-step. For **launderers and innocents**, `F(s') = τ · logsumexp_{a ∈ M_initiate(s')} (Q_initiate^targ(s', a) / τ)`, the **root target** (ours). For the inspector's **global branches**, `F(s') = (1/|B(s')|) Σ_{b ∈ B(s')} τ · logsumexp_{a ∈ M_b(s')} (Q_b^targ(s', a) / τ)`. Both depend on `s'` alone, so no next-step action is needed. The loss is `(1/|R(s,a)|) Σ_{b ∈ R(s,a)} (y − Q_b(s, a_b))²`, the BDQ form with mean aggregation over the branches whose choice took effect (§9.3). The behaviour policy is softmax(Q_b / τ) per branch over `M_b`, combined with ε-greedy that decays from 1.0 to 0.05 over the first 300 episodes. As τ → 0 this is Algorithm 1's max. |
+
+**Why the root target (ours; revised after M5's first runs).** `initiate` is in `B(s)` and realized under every action, so it is the only branch that every transition trains. The other branches rank a launch's options and stay out of the bootstrap. The first version of this SPEC bootstrapped launderers and innocents through the mean over all of `B(s')`. But when an agent waits only `initiate` is realized, so five branches trained only on launches carried most of every idle state's target. In M5's first runs the launderer values inflated: `Q(wait)` reached 6.5–357, where no return above a few units was attainable (reports/m5_marl.md). This conditional BDQ variant is ours and has no general convergence guarantee. Those runs also discounted by γ per decision, so a 50-sub-step gap cost one γ; γ is now per sub-step.
 | `done` | `d = 1` only at **world end**. Time-step (episode) boundaries are bootstrapped through, because funds and addresses persist within a world. A detector `select_tx` flag transition is always terminal: `d = 1`, so `y = r`. |
 | Batch 128 but no replay buffer | A replay buffer per role holds 100k transitions of agent-view observations (capped at 256 nodes), plus a 1,000-transition warm-up. |
 | No target network | A Polyak-averaged target network with rate 0.005. |
@@ -577,10 +587,26 @@ The `size = 10 + 148·n_in + 34·n_out` formula matches the real median `size` w
 - per-role mean episode reward;
 - detection rate (recall on illicit cash-out txs);
 - the **illicit/licit tx ratio** among executed txs per episode. This is our definition of Fig. 5's undefined ratio (G15);
-- launderer success fraction;
+- where the launderers' proceeds went, as fractions of them: cashed out undetected (the **success fraction**), frozen (change included), paid in fees, and still held. They close, `proceeds = cashed + frozen + fees + held`, and the gap is logged every epoch. **BTC utility** is the success fraction minus the frozen fraction;
 - each strategy's usage share.
 
-A run is **degenerate** if, over the last 20 epochs, either the detection rate or the launderer success fraction stays above 0.95 or below 0.05. A degenerate run is reported as such, and triggers the fallbacks in §16.
+A run is **degenerate** if, over the last 20 epochs, either the detection rate or the launderer success fraction stays above 0.95 or below 0.05. A degenerate run is reported as such, as a warning. It no longer decides acceptance on its own.
+
+**Acceptance of a MARL run (ours; replaces the degenerate rule as the M5 gate).** M5's first runs passed the degenerate rule by the letter while their launderers had not learned: against their final inspectors, a scripted `direct` policy cashed out most of its proceeds, while the learned launderers chose templates that were almost always caught (reports/m5_marl.md, reports/m5_capability.md). A run passes if:
+1. **Complete:** 1,000 episodes, every loss finite, and the BTC accounting closes every epoch (gap ≤ 1e-6 of proceeds).
+2. **Calibrated values:** on held-out worlds at ε = 0, the mean of `Q_initiate(s, a) − G` over launderer decisions is within `max(0.5, 0.25 · mean |G|)`. `G` is the realized return from the decision, with γ per sub-step, to world end.
+3. **Adapted launderers:** the final launderers play 8 held-out multiverse worlds, the same for every policy compared, against the run's final inspector and innocents frozen at ε = 0.05. At **matched launch opportunities**, each launderer launches once per episode, at a sub-step drawn uniformly from [0, 43], and the network chooses every option. There the final launderers must beat (a) uniform option choices and (b) the run's own launderer snapshot at world 30, where ε reaches its floor, each by at least 0.02 in BTC utility. The paired 95 % t-interval over the worlds of all 3 seeds must lie above 0, and the mean difference must be ≥ 0 in at least 2 of the 3 seeds.
+
+Reported, not gated:
+- the natural policy (the network also decides when to launch) against wait-only and the static (NMAI) launderers;
+- launch, proceed and detection rates;
+- the health curves.
+
+**Calling it co-evolution.** Adapting to a frozen inspector does not show feedback. A passing run is called co-evolved only if two checks on the same held-out worlds both give paired 95 % intervals above 0, pooled over seeds:
+- (a) the inspector responded: the final inspector freezes a larger share of the final launderers' proceeds than the world-30 inspector does;
+- (b) the launderers responded: against the final inspector, the final launderers earn more BTC utility than a **no-feedback control**, which is launderers trained from the world-30 snapshot for the same number of episodes against the world-30 inspector, frozen.
+
+Otherwise the report says "adaptation shown, co-evolution not identified".
 
 ## 11. Transfer protocol
 
@@ -619,6 +645,11 @@ The pretraining runs are 3 Full, 3 NDA and 3 NMAI, one per seed. Each run produc
 
 **What Full − NDA means here.** NDA drops `L_aux` and the in-loop target batches. It keeps the target-informed calibration, the shared normalization and source replay. So Full − NDA measures the **coupled pipeline effect**: feature alignment, the regularization that `L_aux` adds, and the simulator trajectories that change because the detector changed. It does not isolate feature alignment. And because sim and real share one schema (§7), it does not test the heterogeneous-schema alignment that the paper's AMLSim source needed. Report it with this caveat.
 
+**What Full − NMAI means here (ours; added after M5's first runs).**
+- Full, NDA and NMAI share every simulator mechanic: the generator, the proceeds schedules, the reward and accounting definitions, the label rules, the world draws and the number of detector updates.
+- In NMAI the inspector acts and trains exactly as in Full. Only the transaction agents do not learn: launderers draw typologies uniformly, and innocents use scripted routes.
+- Full also learns its innocents, so Full − NMAI measures the effect of the learned transaction agents as a whole. Attribute it to launderer–inspector feedback only if a control with scripted innocents in Full supports that, and only if the run passes §10's co-evolution check.
+
 **Deliverable:** `reports/results.md`, containing:
 - the main tables, one per task (illicit F1, PR-AUC, ROC-AUC, P, R, R@1 %, and the comparison-only metrics; mean ± sd);
 - the Δ-vs-T0 bootstrap CIs;
@@ -640,6 +671,8 @@ The pretraining runs are 3 Full, 3 NDA and 3 NMAI, one per seed. Each run produc
 | Discount γ | 0.99 | paper |
 | Batch size | 128 | paper |
 | Dropout | 0.5 (GAT features and attention) | paper |
+| Launderer / innocent Q-network dropout | PENDING: set by the M5 capability test | ours |
+| Launderer / innocent target | root: bootstrap through `initiate` only, γ per sub-step (§10) | ours |
 | Latent dims Z_s / Z_d / Z_n | 256 / 64 / 128 | paper |
 | β (KL weight) | 0.01 | paper |
 | ENTROPY_COEF | 0.01, used as the soft-Q temperature τ | paper value, our use (G7) |
@@ -666,7 +699,7 @@ The paper's gotchas G1–G16 are from the digest. E1–E20 are new.
 | G4 | Eq. 9's exponent is signed | Use `|L_i − L_j|`. | 8.1 |
 | G5 | Signs in Eqs. 20–21 | Minimize NLL + β·KL. δ maximizes the NLL. | 8.3–8.4 |
 | G6 | Eq. 20 is not a VGAE objective | Add recon, a domain head, and KL on Z_s and Z_n (each labelled as added). | 8.3 |
-| G7 | "MADDPG" vs Algorithm 1 | BDQ-style branching soft-Q per role (per-branch Q, shared mean target, feasibility masks, world-end terminal), with replay, a target network and parameter sharing. L_DA and L_adv apply to the detectors only. | 10 |
+| G7 | "MADDPG" vs Algorithm 1 | BDQ-style branching soft-Q per role (per-branch Q, one shared target per transition: the root branch for launderers and innocents, the branch mean for the inspector's global branches; feasibility masks, world-end terminal, γ per sub-step), with replay, a target network and parameter sharing. L_DA and L_adv apply to the detectors only. | 10 |
 | G8 | Episodes vs epochs | Episode = one time step, world = 10 episodes = 1 epoch. T = 50. `done` defined. | 9.2 |
 | G9 | Unreported values | All set in §13 and §9.3 and marked (ours). | 13 |
 | G10 | Table 2 inconsistencies | The text's "822k wallets, 1.27M temporal interactions" matches the README: 822,942 wallets, 1,268,260 wallet rows. Table 2's 859,254 nodes and 995,508 edges match nothing we can derive. Our Table 2 analogue reports E/N *and* 2E/N. | 2, 11 |
@@ -706,7 +739,7 @@ The paper's gotchas G1–G16 are from the digest. E1–E20 are new.
 | M2 | S0 RF anchor | Illicit F1 within ±0.03 of 0.828 (T) and 0.845 (W). Otherwise stop and fix the pipeline. | local | — |
 | M3 | T0 | Gate on **val**: T0's val illicit-F1 ≥ that of an RF refit on the *fitting split only*, minus 0.05, on both tasks. (S0 itself trains on official-train, which includes val.) Test is not looked at here. | local (1650S) or A30 | 2 A30-h |
 | M4 | Simulator, static mode, calibration | Unit tests on a hand-built ledger: conservation of BTC (`in = out + fee`), the flow edge rule, the label rules (E6), the shortcut guard (§9.4), every manifest definition and sentinel, feasibility masks, the sub-step order (reservation conflicts become no-ops; reverted txs leave no trace), and the export recompute. Calibration report. | local | — |
-| M5 | MARL Full, NDA (3 seeds each) | Health curves present, no NaNs, 1,000 episodes complete, non-degenerate (§10). | A30 | ≈ 6 runs × 2.5 h = 15 h |
+| M5 | MARL Full, NDA (3 seeds each) | First, the frozen-opponent capability test passes (`hns.marl.capability`, reports/m5_capability.md). Then: health curves present, and the §10 acceptance (complete with closed accounting, calibrated values, adapted launderers). The degenerate rule and the co-evolution check are reported. | A30 | ≈ 6 runs × 2.5 h = 15 h (first runs: 3.5–3.8 h each, six at once on one A30) |
 | M6 | NMAI pretrain, exports, JS | JS table, Fig. 6 analogue, Table 2 analogue. | A30 | 2 h |
 | M7 | Fine-tune grid (4 arms × 3 fractions × 3 seeds × 2 tasks, plus zero-shot) | All runs logged. `reports/results.md` generated by `hns.eval.report`. | A30, 4 processes in parallel | ≈ 4 h |
 | M8 | Optional: Q4 noise sweep, SRF, W-temporal, T0-shared, X2 (v1-only T) | — | A30 | ≤ 4 h |
@@ -715,12 +748,16 @@ The total is about 25 A30-hours. M5's 2.5 h per run is an estimate: measure it o
 
 ## 16. Risks and fallbacks
 
-- **MARL is unstable or degenerate.**
-  1. Freeze innocents to their scripted routes, so only two roles learn.
-  2. Then shrink the strategy set.
-  3. Then raise or lower the detector budget range.
+- **MARL is unstable, degenerate, or fails the §10 acceptance.**
+  - **Test the learner before the game** (ours; added after M5's first runs). Check the target, the BTC accounting and the role networks' train/eval dropout gap, then run the frozen-opponent capability test (`hns.marl.capability`). If a legal scripted policy is profitable and the learned one misses it, repair the learner or its exploration; do not make the game easier.
+  - Only if well-covered policies find no escape, change the game, one change at a time and in every simulator arm alike:
+    1. Freeze innocents to their scripted routes, so only two roles learn.
+    2. Then shrink the strategy set.
+    3. Then raise or lower the detector budget range.
+  - Each repair cycle is declared in advance. It ends with the capability test and a short live pilot before any full re-run.
+  - **Stop rule.** After two repair cycles without passing the §10 acceptance, stop tuning. Run M6/M7 with the static (NMAI) pretraining against T0, report the co-trained detectors as an exploratory arm, and report Q3 as "co-evolution not identified". Never choose an M5 variant or checkpoint after seeing an M7 target-test result.
 
-  Report which fallback was used.
+  Report which fallbacks were used.
 - **The simulator detector wins trivially** (detection > 0.95 from early on). The launderers are too weak. Widen `k` or the hop limit, or lower `b`.
 - **Launderer txs are separable by template shape alone.** Detect this by a static-mode probe on shared features (template-only criminals, spend-all inputs, pruning artefacts), or by the bullet above. Bounded fix: give launderers ordinary spending that reuses the innocents' demand machinery. AMLworld motivates this: 81,143 of its 100,604 LI-Large laundering txs fall outside the 8 patterns (its Table 8). Import the mechanism only, not AMLworld's banking proportions. Full placement models, shell-company economies and transitive-taint labels stay out of scope. Taint is not how Elliptic++ labels txs.
 - **Aggregate rates are unstable.** In an agent-based generator, small parameter changes can swing aggregate rates sharply (AMLworld §5). Report per-world tx counts and the true illicit share for every multiverse draw, and look at them before M5.
