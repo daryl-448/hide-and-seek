@@ -932,20 +932,31 @@ def test_repair2_gates_and_the_selection_rule():
 def test_repair2_stage0_reads_which_came_first():
     from hns.marl.repair2 import read_timeline
 
-    alive, dead = {w: 0.1 for w in range(1, 31)}, {w: (0.1 if w < 20 else 0.8) for w in range(1, 31)}
+    def blind(*dead):                                           # worlds 1..30, the given ones inactive
+        return {w: (0.8 if w in dead else 0.1) for w in range(1, 31)}
+
     held = {w: 0.4 for w in range(15, 31)}
     lost = {w: (0.4 if w < 25 else 0.1) for w in range(15, 31)} | {22: 0.45}
-    r = read_timeline(dead, lost)
-    assert (r["collapse"], r["best"], r["loss"], r["reading"]) == (20, 22, 25, "trunk first")
-    assert read_timeline(alive, lost)["reading"] == "policy first" and read_timeline(alive, lost)["collapse"] is None
-    late = {w: (0.1 if w < 28 else 0.8) for w in range(1, 31)}
-    assert read_timeline(late, lost) | {"blind_final": 0} == r | {"collapse": 28, "reading": "policy first", "blind_final": 0}
-    assert read_timeline(dead, held)["reading"] == "no loss" and read_timeline(dead, held)["loss"] is None
-    dip = lost | {30: 0.3}                                      # a dip that recovers by world 30 is not a loss
-    assert read_timeline(dead, dip)["reading"] == "no loss"
-    flicker = dead | {3: 0.9, 24: 0.2}                          # only the last unbroken stretch counts as a collapse
-    assert read_timeline(flicker, lost)["collapse"] == 25
-    assert read_timeline(dead | {30: 0.2}, lost)["collapse"] is None
+    r = read_timeline(blind(*range(20, 31)), lost)
+    assert (r["best"], r["loss"], r["collapse"], r["reading"]) == (22, 25, 20, "trunk first")
+    assert read_timeline(blind(), lost)["reading"] == "policy first"
+    assert read_timeline(blind(*range(28, 31)), lost)["reading"] == "policy first"      # inactive only after the loss
+    assert read_timeline(blind(*range(5, 10)), lost)["reading"] == "policy first"       # and only before the best
+    assert read_timeline(blind(*range(20, 31)), held) | {"loss": None} == read_timeline(blind(*range(20, 31)), held)
+    assert read_timeline(blind(*range(20, 31)), held)["reading"] == "no loss"
+    assert read_timeline(blind(*range(20, 31)), lost | {30: 0.3})["reading"] == "no loss"      # recovered by world 30
+    # inactive at the loss, active again later: still the trunk (the stretch that contains the loss counts)
+    r = read_timeline(blind(*range(20, 26), 28, 29, 30), lost)
+    assert (r["collapse"], r["reading"]) == (20, "trunk first")
+    assert read_timeline(blind(23, 24), lost)["reading"] == "inconclusive"               # inactive before, active at it
+    # a dip that recovers does not set the loss: the last run of low snapshots does
+    dip = {w: 0.55 for w in range(15, 31)} | {15: 0.60, 18: 0.20} | {w: 0.20 for w in range(25, 31)}
+    r = read_timeline(blind(*range(24, 31)), dip)
+    assert (r["best"], r["loss"], r["collapse"], r["reading"]) == (15, 25, 24, "trunk first")
+    # an aborted run: no reading without every snapshot from world 15 and every world's diagnostics
+    assert read_timeline({}, {})["reading"] == "incomplete"
+    assert read_timeline(blind(), {w: 0.4 for w in range(15, 28)})["reading"] == "incomplete"
+    assert read_timeline({w: 0.1 for w in range(1, 28)}, lost)["reading"] == "incomplete"
 
 
 def test_repair2_an_aborted_confirmation_seed_fails_the_cycle(tmp_path, monkeypatch):

@@ -40,17 +40,23 @@ snapshots and diagnostics. No fix is tested, and the two runs are the screen's `
 trunk already inactive when the policy is lost? ``timeline`` plays every snapshot from world 15 on two further
 held-out worlds (``EVAL_SALT`` with j = 400 and 401, used for nothing else) and reads, per run:
 
-- collapse: the first world from which, through world 30, at least half of the panel's idle states have no trunk
-  unit firing;
-- loss: with ``U`` the snapshots' natural BTC utility (sampled policy) and ``U*`` its maximum, at the earliest
-  such world: if the world-30 snapshot has ``U <= U* - 0.25``, the first world after the best one with
-  ``U <= U* - 0.25``; otherwise there is no loss;
-- the reading: ``no loss``; ``trunk first`` if there is a collapse at or before the loss; else ``policy first``.
+- loss: with ``U`` the snapshots' natural BTC utility (sampled policy) and ``U*`` its maximum (the best
+  snapshot: the earliest with it), a snapshot is low if ``U <= U* - 0.25``. If the world-30 snapshot is not low
+  there is no loss. Otherwise the loss is the first world of the unbroken run of low snapshots that ends at
+  world 30: a dip that recovered does not count;
+- the trunk is inactive at a world if at least half of the panel's idle states have no trunk unit firing there;
+- the reading: ``no loss``; ``trunk first`` if the trunk is inactive at the loss world (collapse: the first world
+  of the unbroken inactive stretch that contains it); ``policy first`` if the trunk is active at every world from
+  the best snapshot's through the loss world; ``inconclusive`` otherwise (inactive somewhere in between, active
+  at the loss); ``incomplete`` if the run aborted, so that a snapshot from world 15 to 30 or a world's
+  diagnostics is missing.
 
-``trunk first`` in every run that has a loss: the screen runs as declared. ``policy first`` in any run: the
-trunk is not what loses the policy there, and the cells are revised before the screen. ``no loss`` in both runs:
-the legacy failure did not recur, which is reported before anything else runs. The panel's share of idle states
-whose best strategy is ``direct`` is printed next to it, as a second view of the policy on fixed states.
+``trunk first`` in both runs: the screen runs as declared. ``policy first`` in either: the trunk is not what
+loses the policy there, and the cells are revised before the screen. Any other combination is reported before
+anything else runs. The panel's share of idle states whose best strategy is ``direct`` is printed next to it,
+as a second view of the policy on fixed states. (The reading was tightened after a review and before any result
+was read: the first wording took the last collapse and the first low snapshot, so a trunk that recovered after
+the loss, or a dip that recovered before it, could have decided the order.)
 
 **Logs.** Per world, in ``metrics.jsonl`` (``hns.marl.train``): rewards (also discounted), where the proceeds
 went, launderer decisions by state and outcome, launches by strategy x amount x change, the learner's sampled
@@ -641,33 +647,44 @@ def cmd_sweep(a) -> None:
 
 # ---------------------------------------------------------------------------- stage 0: the timeline
 def read_timeline(blind: dict[int, float], utility: dict[int, float]) -> dict:
-    """Stage 0's reading of one run. ``blind``: per training world, the share of the panel's idle states with no
-    trunk unit firing. ``utility``: per snapshot world, its natural BTC utility on the timeline worlds."""
-    last = max(blind)
-    collapse = None
-    for w in sorted(blind, reverse=True):                      # the start of the last unbroken stretch to the end
-        if blind[w] < COLLAPSE:
-            break
-        collapse = w
+    """Stage 0's reading of one run (the module docstring declares it). ``blind``: per training world, the share
+    of the panel's idle states with no trunk unit firing. ``utility``: per snapshot world, its natural BTC utility
+    on the timeline worlds."""
+    out = {"collapse": None, "best": None, "loss": None}
+    if set(utility) != set(range(TIMELINE_FROM, WORLDS + 1)) or not set(range(1, WORLDS + 1)) <= set(blind):
+        return out | {"reading": "incomplete"}
     best = min(utility, key=lambda w: (-utility[w], w))
-    loss = None
-    if utility[max(utility)] <= utility[best] - LOSS:
-        loss = min(w for w in utility if w > best and utility[w] <= utility[best] - LOSS)
-    reading = "no loss" if loss is None else "trunk first" if collapse is not None and collapse <= loss else "policy first"
-    return {"collapse": collapse, "best": best, "best_utility": utility[best], "final_utility": utility[max(utility)],
-            "loss": loss, "reading": reading, "blind_final": blind[last]}
+    low = {w for w in utility if utility[w] <= utility[best] - LOSS}
+    out |= {"best": best, "best_utility": utility[best], "final_utility": utility[WORLDS], "blind_final": blind[WORLDS]}
+    if WORLDS not in low:
+        return out | {"reading": "no loss"}
+    loss = WORLDS
+    while loss - 1 in low:                                     # the run of low snapshots that ends at the last world
+        loss -= 1
+    dead = {w for w in blind if blind[w] >= COLLAPSE}
+    if loss in dead:
+        collapse = loss
+        while collapse - 1 in dead:
+            collapse -= 1
+        return out | {"loss": loss, "collapse": collapse, "reading": "trunk first"}
+    return out | {"loss": loss, "reading": "inconclusive" if dead & set(range(best, loss)) else "policy first"}
 
 
 def cmd_timeline(a) -> None:
     out = run_dir(a.cell, a.opp, a.seed)
     diag = [json.loads(x) for x in (out / "diag.jsonl").read_text().splitlines()]
     epochs = {r["world"] + 1: r for _, r in mt.read_records(out / "metrics.jsonl") if r["kind"] == "epoch"}
-    tr = make(a.cell, a.opp, a.seed, torch.device(a.device))
-    util = {}
+    f, util, tr = out / "timeline.json", {}, None
+    if f.exists():                                             # snapshots already played are not played again
+        util = {r["world"]: r["utility"] for r in json.loads(f.read_text())["rows"] if r["utility"] is not None}
     for w in range(TIMELINE_FROM, WORLDS + 1):
-        if (out / "snap" / f"w{w:02d}.pt").exists():           # an aborted run has snapshots up to its abort
+        if w not in util and (out / "snap" / f"w{w:02d}.pt").exists():     # an aborted run stops short of world 30
+            tr = tr or make(a.cell, a.opp, a.seed, torch.device(a.device))
             load_snapshot(tr, out / "snap" / f"w{w:02d}.pt")
-            util[w] = float(np.mean([r["btc_utility"] for r in evaluate(tr, "boltzmann", TIMELINE_WORLDS)]))
+            try:
+                util[w] = float(np.mean([r["btc_utility"] for r in evaluate(tr, "boltzmann", TIMELINE_WORLDS)]))
+            except FloatingPointError:                         # a non-finite Q: no utility, an incomplete timeline
+                pass
     res = read_timeline({d["world"]: d["panel"]["no_unit_share_idle"] for d in diag if d["world"] >= 1}, util)
     res["rows"] = [{"world": d["world"], "units_active": d["panel"]["units_active"],
                     "blind_idle": d["panel"]["no_unit_share_idle"], "direct_argmax": d["panel"]["direct_argmax_share"],
@@ -675,15 +692,15 @@ def cmd_timeline(a) -> None:
                     "train_utility": epochs[d["world"]]["btc_utility"],
                     "train_direct": epochs[d["world"]]["strategy_share"]["direct"], "utility": util.get(d["world"])}
                    for d in diag if d["world"] >= 1]
-    (out / "timeline.json").write_text(json.dumps(res, indent=1))
+    f.write_text(json.dumps(res, indent=1))
     print(f"{out.name}: world | units firing | blind idle states | direct is best (panel) | margin (tau) | "
           f"training utility, direct share | snapshot utility on worlds {TIMELINE_WORLDS}")
     for r in res["rows"]:
         u = "" if r["utility"] is None else f"{r['utility']:+.3f}"
         print(f"  {r['world']:2d} | {r['units_active']:3d} | {r['blind_idle']:.2f} | {r['direct_argmax']:.2f} | "
               f"{r['direct_margin_tau']:+7.1f} | {r['train_utility']:+.3f}, {r['train_direct']:.2f} | {u}")
-    print(f"collapse: world {res['collapse']}; best snapshot: world {res['best']} ({res['best_utility']:+.3f}); "
-          f"loss: world {res['loss']}; final {res['final_utility']:+.3f}; reading: {res['reading']}")
+    print(f"best snapshot: world {res['best']}; loss: world {res['loss']}; collapse: world {res['collapse']}; "
+          f"reading: {res['reading']}")
 
 
 # ---------------------------------------------------------------------------- gates
