@@ -186,6 +186,9 @@ CELLS = {
     "H": _cell("independent", "hard", "fifo", td="huber"),
     "LN": _cell("independent", "hard", "fifo", head_norm=True),
 }
+# one-factor variants of the legacy learner for the staged tests (hns.marl.stage1); not cells of the screen
+STAGE_CELLS = {"P": CELLS["A"] | {"scale": "wealth"}, "I": CELLS["A"] | {"baseline": "independent"}}
+ALL_CELLS = CELLS | STAGE_CELLS
 RUN_ORDER = ("A", "SSF", "IHF", "IHR", "SHF", "ISF", "SSR", "SHR", "ISR", "W", "H", "LN")
 SIMPLEST_FIRST = ("IHF", "A", "SSF", "ISF", "SHF", "SSR", "ISR", "SHR", "IHR", "W", "H", "LN")
 WORLDS, EPS_EPISODES = 30, 150
@@ -206,7 +209,7 @@ class Abort(RuntimeError):
 
 def make(cell: str, opp: str, seed: int, device, out: Path | None = None) -> mt.Trainer:
     return cap.make(OPPS[opp], device, out, seed=seed, q_dropout=0.0, target="root", design_roles="launderer",
-                    **CELLS[cell])
+                    **ALL_CELLS[cell])
 
 
 def run_dir(cell: str, opp: str, seed: int, smoke: bool = False) -> Path:
@@ -218,7 +221,8 @@ class Net:
     """The trained launderer at epsilon 0. ``mode``: ``boltzmann`` samples ``softmax(Q / tau)`` per branch;
     ``argmax`` takes each branch's best feasible option; ``matched`` samples the options like ``boltzmann`` but
     launches on ``sched``'s once-per-episode schedule and always proceeds in flight. Records, per decision, the
-    root Q-values, the root policy's entropy, whether the launderer was idle, and its log balance."""
+    root Q-values, the root policy's entropy, whether the launderer was idle, its log balance, and the strategy
+    and amount it values most (whether or not it launches)."""
 
     def __init__(self, tr: mt.Trainer, mode: str = "boltzmann", tau: float | None = None,
                  sched: np.random.Generator | None = None):
@@ -241,6 +245,8 @@ class Net:
         if self.mode == "matched" and env.episode != self.ep:
             self.ep, self.launched = env.episode, set()
             self.when = {x.id: int(self.sched.integers(0, cap.LAUNCH_LAST + 1)) for x in env.launderers}
+        o = np.concatenate([[0], np.cumsum(L.sizes)])
+        bs, ba = list(L.branches).index("strategy"), list(L.branches).index("amount")
         for j, i in enumerate(ids):
             st = states[i]
             idle = len(st.branches) > 1
@@ -253,7 +259,8 @@ class Net:
             p = np.exp(z - z.max())
             p /= p.sum()
             ent = 0.0 if self.mode == "argmax" else float(-(p * np.log(np.maximum(p, 1e-300))).sum())
-            self.rec[(tr.step_no, i)] = (float(q[j, 0]), float(q[j, 1]), ent, idle, float(ob.x_c[j, 1]))
+            self.rec[(tr.step_no, i)] = (float(q[j, 0]), float(q[j, 1]), ent, idle, float(ob.x_c[j, 1]),
+                                         int(q[j, o[bs]:o[bs + 1]].argmax()), int(q[j, o[ba]:o[ba + 1]].argmax()))
         names = list(L.branches)
         return {i: {b: int(a[j, bi]) for bi, b in enumerate(names) if b in states[i].branches}
                 for j, i in enumerate(ids)}
@@ -304,14 +311,30 @@ def calibrate(dec: list[tuple], gamma: float, tau: float, mid: float = math.inf)
         return {"n": 0}
     x = np.array(rows, np.float64)
     out = {"n": len(x), "q_max": float(x[:, 0].max()), "q_mean": float(x[:, 0].mean())}
+    btc = np.expm1(x[:, 4])                                    # the source balance, as a weight
     for k, c in (("hard", 1), ("soft", 2)):
         out[f"bias_{k}"] = float((x[:, 0] - x[:, c]).mean())
         out[f"g_abs_{k}"] = float(np.abs(x[:, c]).mean())
+        out[f"bias_{k}_btc"] = float(((x[:, 0] - x[:, c]) * btc).sum() / btc.sum()) if btc.sum() > 0 else 0.0
     for name, m in (("idle", x[:, 3] > 0), ("flight", x[:, 3] == 0), ("bal_low", x[:, 4] < BANDS[0]),
                     ("bal_mid", (x[:, 4] >= BANDS[0]) & (x[:, 4] < BANDS[1])), ("bal_high", x[:, 4] >= BANDS[1]),
                     ("early", x[:, 5] < mid), ("late", x[:, 5] >= mid)):
         out[name] = {"n": int(m.sum())} | ({f"bias_{k}": float((x[m, 0] - x[m, c]).mean()) for k, c in
                                             (("hard", 1), ("soft", 2))} if m.any() else {})
+    return out
+
+
+def gate_table(dec: list[tuple]) -> dict:
+    """Per balance band, over the idle decisions where a launch was feasible: how many, how many launched, and at
+    how many the network's best strategy was ``direct`` and its best amount 50 % (also where it waited: a bad
+    preference that the gate hides still decides what a launch there would do)."""
+    d, half = STRATEGIES.index("direct"), AMOUNTS.index(0.5)
+    out = {k: [0, 0, 0, 0] for k in ("low", "mid", "high")}
+    for _, _, a0, _, rec in dec:
+        if rec is not None and rec[3] and math.isfinite(rec[1]):
+            row = out["low" if rec[4] < BANDS[0] else "mid" if rec[4] < BANDS[1] else "high"]
+            for i, hit in enumerate((True, a0 == GO, rec[5] == d, rec[6] == half)):
+                row[i] += int(hit)
     return out
 
 
@@ -353,6 +376,7 @@ def play(tr: mt.Trainer, lpol, j: int) -> dict:
            "q_cap": float(env.proceeds.sum(0).max() / env.d_w)}
     if isinstance(lpol, Net):
         out["cal"] = calibrate(dec, tr.cfg.gamma, tr.cfg.tau, tr.world_step + EPISODES * SUBSTEPS / 2)
+        out["gate"] = gate_table(dec)
         lpol.rec.clear()
     return out
 
@@ -468,7 +492,9 @@ class Diagnostics:
         si, d = names.index("strategy"), STRATEGIES.index("direct")
         root, strat = q[idle, :2], q[idle, o[si]:o[si + 1]]
         top = np.sort(strat, axis=1)
-        rows = np.round(np.concatenate([np.where(np.isfinite(root), root, 0.0), strat], axis=1), 4)
+        m = L.scale_of(self.ob)                                # under the wealth scale Q = m q: the modal row is q's,
+        m = np.ones((len(q), 1), np.float32) if m is None else m.cpu().numpy()    # so m cannot hide a blind network
+        rows = np.round(np.concatenate([np.where(np.isfinite(root), root, 0.0), strat], axis=1) / m[idle], 4)
         modal = np.unique(rows, axis=0, return_counts=True)[1].max() / len(rows)
         best = np.where(np.isfinite(root), root, -np.inf).max(1)
 
@@ -482,6 +508,7 @@ class Diagnostics:
 
         return {"q_table": table(q), "q_table_target": table(qt),
                 "q_abs_max": float(np.abs(q[self.masks]).max()),
+                "q_net_abs_max": float(np.abs((q / m)[self.masks]).max()), "scale_max": float(m.max()),
                 "q_wait_idle": float(root[:, WAIT].mean()),
                 "go_minus_wait_tau": float(np.median((root[:, GO] - root[:, WAIT])[np.isfinite(root[:, GO])]) / tau),
                 "direct_margin_tau": float(np.median(strat[:, d] - np.delete(strat, d, 1).max(1)) / tau),
@@ -505,10 +532,13 @@ class Diagnostics:
         b = L.buf.sample(256, self.rng)
         y = L.batch_target(b)
         L.net.train()
-        q = L._q(L.net, collate(b["obs"]), b["masks"])
+        ob = collate(b["obs"])
+        q = L._q(L.net, ob, b["masks"])
         realized = torch.from_numpy(b["realized"]).to(q.device)
         qa = taken(q, L.sizes, torch.from_numpy(b["action"]).to(q.device), realized)
-        e = (y.unsqueeze(1) - qa) ** 2 * realized
+        e = (y.unsqueeze(1) - qa) ** 2 * realized              # squared residuals in reward units
+        m = L.scale_of(ob)
+        e_loss = e if m is None else e / m ** 2                # what the loss weighs: divided by m(s)^2 under the scale
         names = list(L.branches)
         si = names.index("strategy")
         n_launch = int(realized[:, si].sum())
@@ -529,7 +559,7 @@ class Diagnostics:
             g = torch.autograd.grad(loss, shared, retain_graph=True, allow_unused=True)
             return torch.cat([(torch.zeros_like(p) if x is None else x).reshape(-1) for x, p in zip(g, shared)])
 
-        g_root, g_str = grad(e[:, 0].mean()), grad(e[:, si].sum() / n_launch)
+        g_root, g_str = grad(e_loss[:, 0].mean()), grad(e_loss[:, si].sum() / n_launch)
         cos = torch.dot(g_root, g_str) / (g_root.norm() * g_str.norm()).clamp_min(1e-30)
         return out | {"root_norm": float(g_root.norm()), "strategy_norm": float(g_str.norm()), "cosine": float(cos)}
 
@@ -546,7 +576,9 @@ def cmd_train(a) -> None:
         print(f"{out}: done")
         return
     if out.exists():
-        shutil.rmtree(out)                                     # a killed run starts again from nothing
+        if a.cell in STAGE_CELLS and not smoke:                # a staged test's run is one attempt (hns.marl.stage1)
+            raise SystemExit(f"{out}: an incomplete run of a stage cell is not restarted")
+        shutil.rmtree(out)                                     # a killed run of the screen starts again from nothing
     (out / "snap").mkdir(parents=True)
     tr = make(a.cell, a.opp, a.seed, torch.device(a.device), out)
     L = tr.roles["launderer"]
@@ -582,7 +614,7 @@ def cmd_train(a) -> None:
     res = {"cell": a.cell, "opp": a.opp, "seed": a.seed, "worlds": a.worlds, "status": status, "git_sha": mt.git_sha(),
            "accounting_gap_max": max((abs(e["accounting_gap"]) for e in tr.epochs), default=0.0),
            "zero_trunk_share": diag.panel_stats()["zero_trunk_share"] if status == "ok" else None}
-    if status == "ok":
+    if status == "ok" and not a.no_eval:                      # a staged test evaluates with its own command
         worlds = PANELS["selection"][:a.eval_worlds]
         try:
             ev = _eval_final(tr, worlds)
@@ -741,7 +773,7 @@ def sound(res: dict, ev: dict | None) -> dict:
     """P1 of one run: no abort, closed accounting, a live trunk, and calibrated values on ``ev``."""
     if res["status"] != "ok" or ev is None:
         return {"p1": False, "status": res["status"]}
-    cal = calibration_gate(ev, CELLS[res["cell"]]["backup"])
+    cal = calibration_gate(ev, ALL_CELLS[res["cell"]]["backup"])
     q_cap = max((r["cal"]["q_max"] / max(r["q_cap"], 1e-12) for r in ev["boltzmann"] if r["cal"]["n"]), default=0.0)
     ok = res["accounting_gap_max"] <= ACCT_MAX and res["zero_trunk_share"] <= DEAD_MAX and cal["ok"]
     return {"p1": bool(ok), "status": "ok", "calibration": cal, "accounting_gap_max": res["accounting_gap_max"],
@@ -906,13 +938,14 @@ def main(argv=None) -> int:
             p.add_argument("--opp", choices=list(OPPS), required=True)
             p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
         if name in ("train", "sweep", "timeline"):
-            p.add_argument("--cell", choices=list(CELLS), required=True)
+            p.add_argument("--cell", choices=list(ALL_CELLS), required=True)
         if name in ("train", "confirm-eval", "sweep", "timeline"):
             p.add_argument("--seed", type=int, default=0)
         if name in ("train", "refs", "confirm-eval"):
             p.add_argument("--eval-worlds", type=int, help="fewer evaluation worlds: a smoke run, never a result")
         if name == "train":
             p.add_argument("--worlds", type=int, default=WORLDS, help="training worlds; anything else is a smoke run")
+            p.add_argument("--no-eval", action="store_true", help="train, snapshot and log only (hns.marl.stage1 reads it)")
         if name == "refs":
             p.add_argument("--worlds", choices=list(PANELS), default="selection")
     a = ap.parse_args(argv)

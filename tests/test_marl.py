@@ -1061,6 +1061,188 @@ def test_repair2_policies_panel_and_safety_check(tmp_path, monkeypatch):
 
 
 
+# ---------------------------------------------------------------------------- stage 1: the wealth scale and its reading
+def test_wealth_scale_changes_the_output_and_the_loss_only(tmp_path, monkeypatch):
+    from hns.marl import learner as lm
+
+    x_c = np.zeros((2, L_CTRL), np.float32)
+    x_c[0, 1], x_c[1, 1], x_c[1, 3] = np.log1p(4.0), np.log1p(1.0), np.log1p(2.0)     # source; source and holders
+    assert np.allclose(lm.wealth_scale(x_c), 1.0 + np.array([4.0, 3.0]) / math.exp(1.5), rtol=1e-6)
+    tr = _trainer(tmp_path, monkeypatch, "nda", episodes=2, scale="wealth", design_roles="launderer")
+    tr.run()
+    L = tr.roles["launderer"]
+    assert tr.roles["innocent"].design["scale"] == "raw" and tr.roles["innocent"].scale_of(None) is None
+    b = L.buf.sample(tr.cfg.batch, np.random.default_rng(3))
+    ob = collate(b["obs"])
+    m = torch.from_numpy(lm.wealth_scale(ob.x_c))
+    with torch.no_grad():
+        q, Q = L._q(L.net, ob, b["masks"], scaled=False), L._q(L.net, ob, b["masks"])
+    fin = torch.isfinite(q)
+    assert (m >= 1).all() and (m > 1).any() and torch.allclose(Q[fin], (q * m[:, None])[fin])
+    assert np.allclose(L.q_values(ob, b["masks"])[fin.numpy()], Q[fin].numpy(), atol=1e-6)    # acting uses Q
+    # the target stays in reward units and bootstraps through Q(s') = m(s') q(s'); the loss fits q to y / m(s)
+    y = torch.from_numpy(b["reward"]).clone()
+    with torch.no_grad():
+        nxt = collate(b["next_obs"])
+        q2 = L._q(L.targ, nxt, b["next_masks"], scaled=False) * torch.from_numpy(lm.wealth_scale(nxt.x_c))[:, None]
+    y[torch.from_numpy(~b["done"])] += torch.from_numpy(tr.cfg.gamma ** b["gap"].astype(np.float64)).float() * root_value(
+        q2, L.sizes, tr.cfg.tau)
+    assert torch.allclose(L.batch_target(b), y, atol=1e-5)
+    seen = {}
+
+    def fake_td(q, sizes, action, realized, y, kind="mse"):
+        seen["y"], seen["q"] = y.detach().clone(), q.detach().clone()
+        return (torch.where(torch.isfinite(q), q, torch.zeros_like(q)) * 0.0).sum()
+
+    monkeypatch.setattr(lm, "td_loss", fake_td)
+    L.update(np.random.default_rng(3))                          # draws the same batch
+    assert torch.allclose(seen["y"], y / m, atol=1e-5) and torch.allclose(seen["q"][fin], q[fin], atol=1e-6)
+    st = tr.epochs[-1]["learner"]["launderer"]
+    assert st["scale_mean"] > 1 and st["scale_max"] >= st["scale_mean"]
+    assert all(st["branch_mse_norm"][k] <= st["branch_mse"][k] + 1e-12 for k in st["branch_mse"])
+    assert tr.epochs[-1]["learner"]["innocent"]["scale_mean"] == 1.0
+    with pytest.raises(ValueError):
+        MarlConfig(scale="log")
+    with pytest.raises(ValueError):                             # not defined for innocents
+        _trainer(tmp_path, monkeypatch, "nda", episodes=2, scale="wealth", out_name="both")
+
+
+def test_stage1_cells_offline_fit_and_choice():
+    from hns.marl import repair2 as r2, stage1 as s1
+    from hns.marl.learner import WEALTH_REF
+
+    assert r2.STAGE_CELLS["P"] == r2.CELLS["A"] | {"scale": "wealth"} and r2.STAGE_CELLS["I"] == r2.CELLS["A"] | {
+        "baseline": "independent"} and not set(r2.STAGE_CELLS) & set(r2.CELLS)
+    for c in r2.STAGE_CELLS.values():
+        MarlConfig(**c)
+    torch.manual_seed(0)
+    sizes = list(BRANCHES["launderer"].values())
+    n = 240
+    funds = torch.rand(n) * 20
+    x_c = torch.zeros(n, L_CTRL)
+    x_c[:, 1] = torch.log1p(funds)
+    realized = torch.zeros(n, len(sizes), dtype=torch.bool)
+    realized[:, 0], realized[::3, 1:] = True, True
+    d = {"h": torch.randn(n, 16), "masks": torch.ones(n, sum(sizes), dtype=torch.bool), "realized": realized,
+         "action": torch.stack([torch.randint(0, k, (n,)) for k in sizes], 1), "cand": torch.randn(n, K_RECIPIENTS, D_CAND),
+         "x_c": x_c, "t": torch.arange(n) * 25, "w": torch.cat([torch.ones(n // 2), torch.full((n - n // 2,), 3.0)]).double(),
+         "m": (1 + funds / WEALTH_REF).unsqueeze(1), "y": torch.randn(n) * (1 + funds / WEALTH_REF)}
+    d["held"] = (d["t"] // 500) % 3 == 0
+    assert 0 < d["held"].sum() < n
+    p = s1.fit(d, "shared", False, updates=20)
+    assert p.shape == (n, len(sizes)) and (p[~realized] == 0).all() and torch.isfinite(p).all()
+    assert not torch.equal(p, s1.fit(d, "independent", True, updates=20))
+    assert torch.equal(p, s1.fit(d, "shared", False, updates=20))                       # same weights, same batches
+    ms = s1.measures(d, p)
+    h = d["held"].numpy()
+    w, e = d["w"].numpy()[h], (d["y"] - p[:, 0]).numpy()[h].astype(np.float64)
+    m = d["m"].numpy()[h, 0].astype(np.float64)
+    assert math.isclose(ms["root"], math.sqrt((w * e ** 2).sum() / w.sum()), rel_tol=1e-6)
+    assert math.isclose(ms["root_norm"], math.sqrt((w * (e / m) ** 2).sum() / w.sum()), rel_tol=1e-6)
+    wb = w * funds.numpy()[h]
+    assert math.isclose(ms["root_btc"], math.sqrt((wb * e ** 2).sum() / wb.sum()), rel_tol=1e-4)
+    rc = realized.numpy()[h][:, 1:]
+    ec = (d["y"][:, None] - p[:, 1:]).numpy()[h].astype(np.float64)
+    wc = np.repeat(w[:, None], rc.shape[1], 1)
+    assert math.isclose(ms["child"], math.sqrt((wc * ec ** 2)[rc].sum() / wc[rc].sum()), rel_tol=1e-6)
+    assert ms["n"] == h.sum() == sum(v["n"] for v in ms["by"].values())
+    k, v = next(iter(ms["by"].items()))
+    sel = (np.where(x_c.numpy()[h][:, 1] < 1.5, "low", np.where(x_c.numpy()[h][:, 1] < 3.0, "mid", "high")) == k.split("/")[0]) & (
+        np.where(d["action"].numpy()[h, 0] == 1, "go", "wait") == k.split("/")[1])
+    assert math.isclose(v["root_norm"], math.sqrt((w[sel] * (e[sel] / m[sel]) ** 2).sum() / w[sel].sum()), rel_tol=1e-6)
+
+    def res(**ratios):                                          # measures relative to shared/raw = 1
+        base = {"root": 1.0, "root_norm": 1.0, "root_btc": 1.0, "child": 1.0}
+        return {"shared/raw": base, "shared/wealth": base | ratios.get("wealth", {}),
+                "independent/raw": base | ratios.get("indep", {}), "independent/wealth": base}
+
+    good_w, good_i = {"root_norm": 0.7, "root": 1.05}, {"child": 0.75}
+    both = {"full0": res(wealth=good_w, indep=good_i), "nda1": res(wealth=good_w, indep=good_i)}
+    assert s1.offline_reading(both)["cell"] == "P" and s1.offline_reading(both)["independent_useful"]
+    one = {"full0": res(wealth=good_w, indep=good_i), "nda1": res(wealth={"root_norm": 0.9}, indep=good_i)}
+    assert s1.offline_reading(one)["cell"] == "I" and not s1.offline_reading(one)["wealth_useful"]     # both opponents
+    worse = {"full0": res(wealth=good_w | {"root": 1.2}), "nda1": res(wealth=good_w)}
+    assert s1.offline_reading(worse)["cell"] is None
+    down = {"full0": res(wealth=good_w | {"root_btc": 1.3}, indep=good_i), "nda1": res(wealth=good_w, indep=good_i)}
+    r = s1.offline_reading(down)
+    assert r["cell"] == "I" and r["wealth_useful"] and r["wealth_down_weighted"]
+    down_only = {"full0": res(wealth=good_w | {"root_btc": 1.3}), "nda1": res(wealth=good_w)}
+    assert s1.offline_reading(down_only)["cell"] == "P" and s1.offline_reading(down_only)["wealth_down_weighted"]
+    slight = {"full0": res(wealth=good_w | {"root_btc": 1.05}, indep=good_i), "nda1": res(wealth=good_w, indep=good_i)}
+    assert s1.offline_reading(slight)["cell"] == "I"            # any BTC-weighted worsening puts P behind I
+
+
+def test_stage1_reading_of_a_run_and_the_gate_table():
+    from hns.marl import repair2 as r2, stage1 as s1
+
+    def rows(u, bias=0.1):
+        cal = {"n": 10, "bias_soft": bias, "g_abs_soft": 0.4, "q_max": 1.0}
+        return [{"world": j, "btc_utility": x, "reward": x, "cal": cal} for j, x in zip(s1.DEV_WORLDS, u)]
+
+    ok = {"status": "ok", "accounting_gap_max": 0.0, "zero_trunk_share": 0.0}
+    a_final, d50 = rows([0.1] * 4), rows([0.6] * 4)
+    good = {20: rows([0.5, 0.5, 0.5, 0.5]), 30: rows([0.52, 0.48, 0.5, 0.46])}
+    r = s1.read_run(ok, good, a_final, d50)
+    assert r["promising"] and r["c1"] and r["c2"] and r["c3"] and r["c4"] and math.isclose(r["utility"]["30"], 0.49)
+    assert np.allclose(r["retention"]["differences"], [0.02, -0.02, 0.0, -0.04])
+    assert not s1.read_run(ok | {"zero_trunk_share": 0.3}, good, a_final, d50)["c1"]
+    assert not s1.read_run(ok, good, a_final, rows([1.2] * 4))["c2"]                       # under half of direct50
+    assert not s1.read_run(ok, good, rows([0.55] * 4), d50)["c2"]                          # more than 0.02 below A
+    lost = {20: rows([0.6] * 4), 30: rows([0.5] * 4)}
+    r = s1.read_run(ok, lost, a_final, d50)
+    assert r["c2"] and not r["c3"] and not r["promising"]
+    assert not s1.read_run(ok, {20: good[20], 30: rows([0.5] * 4, bias=0.7)}, a_final, d50)["c4"]
+    for res, snaps in (({"status": "aborted: x"}, None), (ok, None)):
+        assert s1.read_run(res, snaps, a_final, d50)["promising"] is False
+    assert [x["world"] for x in s1._dev(rows([1, 2, 3, 4])[::-1] + [{"world": 104}])] == list(s1.DEV_WORLDS)
+    d, half = r2.STRATEGIES.index("direct"), r2.AMOUNTS.index(0.5)
+    dec = [(0, 1, r2.GO, 0.0, (0.0, 0.1, 0.0, True, 0.5, d, half)), (1, 1, r2.WAIT, 0.0, (0.0, 0.1, 0.0, True, 3.5, 2, half)),
+           (2, 1, r2.WAIT, 0.0, (0.0, NEG, 0.0, True, 3.5, d, half)), (3, 1, r2.GO, 0.0, (0.0, 0.1, 0.0, False, 3.5, d, half)),
+           (4, 2, r2.WAIT, 0.0, None)]
+    assert r2.gate_table(dec) == {"low": [1, 1, 1, 1], "mid": [0, 0, 0, 0], "high": [1, 0, 0, 1]}
+
+
+def test_stage1_block_is_one_attempt(tmp_path, monkeypatch):
+    from hns.marl import repair2 as r2, stage1 as s1
+
+    monkeypatch.setattr(r2, "RUNS", tmp_path)
+    calls = []
+    monkeypatch.setattr(r2, "cmd_train", lambda a: calls.append((a.cell, a.opp, a.no_eval, a.worlds, a.eval_worlds)))
+    monkeypatch.setattr(s1, "read", lambda a: {"promising": True})
+
+    class A:
+        cell, opp, seed, device = "P", "nda1", 0, "cpu"
+
+    s1.cmd_run(A)
+    mark = json.loads(s1.block_path("P", "nda1").read_text())
+    assert calls == [("P", "nda1", True, r2.WORLDS, None)] and mark["state"] == "done" and mark["promising"] is True
+    with pytest.raises(SystemExit):                             # done: not run again
+        s1.cmd_run(A)
+    # a block that died after starting (the cap, a crash) leaves its marker and is not run again either
+    monkeypatch.setattr(r2, "cmd_train", lambda a: (_ for _ in ()).throw(KeyboardInterrupt()))
+
+    class B(A):
+        cell = "I"
+
+    with pytest.raises(KeyboardInterrupt):
+        s1.cmd_run(B)
+    assert json.loads(s1.block_path("I", "nda1").read_text())["state"] == "started"
+    with pytest.raises(SystemExit):
+        s1.cmd_run(B)
+    assert len(calls) == 1
+    # and the trainer refuses to restart a stage cell's incomplete run, while a screen cell's still restarts
+    monkeypatch.undo()
+    monkeypatch.setattr(r2, "RUNS", tmp_path)
+    r2.run_dir("P", "nda1", 0).mkdir()
+
+    class T:
+        cell, opp, seed, device, worlds, eval_worlds, no_eval = "P", "nda1", 0, "cpu", r2.WORLDS, None, True
+
+    with pytest.raises(SystemExit):
+        r2.cmd_train(T)
+
+
+
 def test_kind_values_agree():
     from hns.models import detector
     assert (detector.KIND_TX, detector.KIND_W, detector.KIND_CTRL) == (KIND_TX, KIND_W, KIND_CTRL)

@@ -141,19 +141,22 @@ class Replay:
         from it (the last rows; ``n_archive`` says how many)."""
         ka = int(round(ARCHIVE_SAMPLE * k)) if self.arch is not None and self.arch.n else 0
         slots = np.flatnonzero(self.nxt[:min(self.n, self.cap)] != PENDING)
-        s = slots[rng.integers(0, len(slots), k - ka)]
-        nxt = self.nxt[s]
-        live = nxt >= 0
-        ns = nxt[live] % self.cap
-        out = {"obs": [self.obs[i] for i in s], "masks": self.masks[s], "active": self.active[s],
-               "action": self.action[s], "realized": self.realized[s], "reward": self.reward[s], "t": self.t[s],
-               "done": ~live, "next_obs": [self.obs[i] for i in ns], "next_masks": self.masks[ns],
-               "next_active": self.active[ns], "gap": self.t[ns] - self.t[s[live]], "n_archive": ka}
+        out = self.take(slots[rng.integers(0, len(slots), k - ka)]) | {"n_archive": ka}
         if ka:
             a = self.arch.sample(ka, rng)
             out = {key: v if key == "n_archive" else (v + a[key] if isinstance(v, list) else np.concatenate([v, a[key]]))
                    for key, v in out.items()}
         return out
+
+    def take(self, s: np.ndarray) -> dict:
+        """The ring's finalized transitions in slots ``s``, as a batch."""
+        nxt = self.nxt[s]
+        live = nxt >= 0
+        ns = nxt[live] % self.cap
+        return {"obs": [self.obs[i] for i in s], "masks": self.masks[s], "active": self.active[s],
+                "action": self.action[s], "realized": self.realized[s], "reward": self.reward[s], "t": self.t[s],
+                "done": ~live, "next_obs": [self.obs[i] for i in ns], "next_masks": self.masks[ns],
+                "next_active": self.active[ns], "gap": self.t[ns] - self.t[s[live]], "n_archive": 0}
 
     def support(self) -> dict:
         """What the buffer holds (repair cycle 2's replay log): entries ever added, finalized entries, the sub-steps

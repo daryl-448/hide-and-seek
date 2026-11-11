@@ -41,6 +41,16 @@ sampled, its per-branch squared errors and its gradient norms in
 ``RoleLearner.stats`` (read and reset by :meth:`RoleLearner.pop_stats`), and
 raises ``FloatingPointError`` on a non-finite loss or gradient.
 
+``scale = "wealth"`` (stage 1, ``hns.marl.stage1``; launderers only) keeps the
+reward, the target and the behaviour temperature in their units and changes
+what the network outputs and what the loss weighs. With ``M(s)`` the BTC the
+launderer can spend, at its source and at its tranche's holders, and
+``m(s) = 1 + M(s) / WEALTH_REF`` (:func:`wealth_scale`), the network outputs
+``q`` and ``Q(s, a) = m(s) q(s, a)``. Acting and the bootstrap use ``Q``, so
+the policy is still ``softmax(Q / tau)`` and ``y`` is unchanged; the loss fits
+``q`` to ``y / m(s)``, which is the squared error of ``Q`` divided by
+``m(s)^2``.
+
 **detector-T** (:class:`DetectorLearner`, the acting inspector):
 ``TD + L_DA + lambda_MARL L_adv`` in one gradient step.
 
@@ -118,6 +128,7 @@ class MarlConfig:
     head_norm: bool = False      # LayerNorm on the readout, before the head's trunk
     replay: str = "fifo"         # fifo | archive
     td: str = "mse"              # mse | huber | branch
+    scale: str = "raw"           # raw | wealth: Q = m(s) q, the loss on q (launderers only)
     design_roles: str = "launderer,innocent"
     beta: float = 0.01
     lam: float = 0.1             # lambda_MARL, preset (§8.4)
@@ -144,7 +155,7 @@ class MarlConfig:
             raise ValueError(f"unknown target {self.target}")
         if (self.baseline not in ("shared", "independent") or self.backup not in ("soft", "hard")
                 or self.trunk_act not in ("relu", "leaky") or self.replay not in ("fifo", "archive")
-                or self.td not in ("mse", "huber", "branch")
+                or self.td not in ("mse", "huber", "branch") or self.scale not in ("raw", "wealth")
                 or not set(self.design_roles.split(",")) <= {"launderer", "innocent", ""}):
             raise ValueError("unknown learner variant")
         if self.backup == "hard" and self.target != "root":
@@ -152,7 +163,7 @@ class MarlConfig:
 
     def design(self, role: str) -> dict:
         """The learner variant of ``role``: the configured one inside ``design_roles``, M5's otherwise."""
-        keys = ("baseline", "backup", "trunk_act", "head_norm", "replay", "td")
+        keys = ("baseline", "backup", "trunk_act", "head_norm", "replay", "td", "scale")
         if role in self.design_roles.split(","):
             return {k: getattr(self, k) for k in keys}
         return {k: MarlConfig.__dataclass_fields__[k].default for k in keys}
@@ -160,6 +171,16 @@ class MarlConfig:
     @property
     def da(self) -> bool:
         return self.arm == "full"
+
+
+WEALTH_REF = math.exp(1.5)       # BTC: the centre's mean proceeds per launderer and episode, exp(mu + sigma^2 / 2)
+
+
+def wealth_scale(x_c: np.ndarray) -> np.ndarray:
+    """``m(s) = 1 + M(s) / WEALTH_REF`` per launderer state, from its controller features (``hns.marl.obs``):
+    ``M`` is the source balance plus the tranche holders' funds, both stored as ``log1p``."""
+    x = np.asarray(x_c, np.float64)
+    return (1.0 + (np.expm1(x[:, 1]) + np.expm1(x[:, 3])) / WEALTH_REF).astype(np.float32)
 
 
 def _t(a, device) -> torch.Tensor:
@@ -196,6 +217,8 @@ class RoleLearner:
             raise ValueError("the root target needs initiate as the first branch")
         ptr = {"recipient": D_CAND} if role == "launderer" else None
         self.design = d = cfg.design(role)
+        if d["scale"] == "wealth" and role != "launderer":
+            raise ValueError("the wealth scale is defined for launderers only")
         self.net = AgentQ(self.branches, 17, D_W_AGENT, L_CTRL if role == "launderer" else I_CTRL, pointer=ptr,
                           dropout=cfg.q_dropout,
                           head={"baseline": d["baseline"], "act": d["trunk_act"], "norm": d["head_norm"]}).to(device)
@@ -209,10 +232,17 @@ class RoleLearner:
         self.n_updates = 0
         self.pop_stats()
 
-    def _q(self, net, ob: ObsBatch, masks: np.ndarray) -> torch.Tensor:
+    def scale_of(self, ob: ObsBatch) -> torch.Tensor | None:
+        """``m(s)`` per state, ``(B, 1)``, under the wealth scale; ``None`` otherwise."""
+        return _t(wealth_scale(ob.x_c), self.device).unsqueeze(1) if self.design["scale"] == "wealth" else None
+
+    def _q(self, net, ob: ObsBatch, masks: np.ndarray, scaled: bool = True) -> torch.Tensor:
+        """``Q`` of every option; ``scaled=False`` gives the network's own output (``q`` under the wealth scale)."""
         g, f = ob.tensors(self.device)
         cand = None if ob.cand is None else _t(ob.cand, self.device)
-        return net(g, f["x_tx"], f["x_w"], f["x_c"], _t(masks, self.device), cand)
+        q = net(g, f["x_tx"], f["x_w"], f["x_c"], _t(masks, self.device), cand)
+        m = self.scale_of(ob) if scaled else None
+        return q if m is None else q * m
 
     @torch.no_grad()
     def q_values(self, ob: ObsBatch, masks: np.ndarray) -> np.ndarray:
@@ -245,8 +275,8 @@ class RoleLearner:
         """The update statistics since the last call, as plain numbers; resets them."""
         st, nb = getattr(self, "stats", None), len(self.branches)
         self.stats = {"n": 0, "rows": 0, "archive_rows": 0, "clipped": 0, "grad": 0.0, "grad_max": 0.0, "grad_enc": 0.0,
-                      "grad_head": 0.0, "sq": np.zeros(nb), "cnt": np.zeros(nb), "coef": np.zeros(nb),
-                      "options": np.zeros(sum(self.sizes), np.int64)}
+                      "grad_head": 0.0, "sq": np.zeros(nb), "sq_norm": np.zeros(nb), "cnt": np.zeros(nb),
+                      "coef": np.zeros(nb), "m": 0.0, "m_max": 0.0, "options": np.zeros(sum(self.sizes), np.int64)}
         if not st or not st["n"]:
             return {"n": 0}
         n, o = st["n"], np.concatenate([[0], np.cumsum(self.sizes)])
@@ -258,6 +288,9 @@ class RoleLearner:
                 "branch_rows": dict(zip(self.branches, (st["cnt"] / n).tolist())),
                 "loss_coef": dict(zip(self.branches, (st["coef"] / n).tolist())),
                 "branch_mse": dict(zip(self.branches, (st["sq"] / np.maximum(st["cnt"], 1)).tolist())),
+                # the same errors divided by m(s)^2 (what the wealth scale's loss sees), and m over the sampled rows
+                "branch_mse_norm": dict(zip(self.branches, (st["sq_norm"] / np.maximum(st["cnt"], 1)).tolist())),
+                "scale_mean": st["m"] / st["rows"], "scale_max": st["m_max"],
                 "sampled_options": {b: st["options"][o[i]:o[i + 1]].tolist() for i, b in enumerate(self.branches)}}
 
     def update(self, rng: np.random.Generator) -> float | None:
@@ -268,13 +301,17 @@ class RoleLearner:
         b = self.buf.sample(cfg.batch, rng)
         y = self.batch_target(b)
         self.net.train()
-        q = self._q(self.net, collate(b["obs"]), b["masks"])
+        ob = collate(b["obs"])
+        m = self.scale_of(ob)
+        q = self._q(self.net, ob, b["masks"], scaled=False)        # the network's output: Q, or q under the wealth scale
         action, realized = _t(b["action"], dev), _t(b["realized"], dev)
-        loss = td_loss(q, self.sizes, action, realized, y, self.design["td"])
+        loss = td_loss(q, self.sizes, action, realized, y if m is None else y / m.squeeze(1), self.design["td"])
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         with torch.no_grad():
-            sq = ((y.unsqueeze(1) - taken(q, self.sizes, action, realized)) ** 2 * realized).sum(0)
+            m1 = torch.ones_like(y).unsqueeze(1) if m is None else m
+            d2 = (y.unsqueeze(1) - taken(q, self.sizes, action, realized) * m1) ** 2 * realized      # in reward units
+            sq, sq_norm = d2.sum(0), (d2 / m1 ** 2).sum(0)
             g_enc = torch.sqrt(sum((p.grad ** 2).sum() for p in self.net.enc.parameters() if p.grad is not None))
         g = torch.nn.utils.clip_grad_norm_(self.net.parameters(), cfg.clip)
         loss_v, g_v = float(loss.detach()), float(g)
@@ -296,6 +333,9 @@ class RoleLearner:
         st["coef"] += (np.concatenate([[1.0], 0.25 * r[:, 1:].any(0)]) if self.design["td"] == "branch"
                        else (r / r.sum(1, keepdims=True)).mean(0))
         st["sq"] += sq.cpu().numpy()
+        st["sq_norm"] += sq_norm.cpu().numpy()
+        st["m"] += float(m1.sum())
+        st["m_max"] = max(st["m_max"], float(m1.max()))
         st["cnt"] += b["realized"].sum(0)
         for i in range(len(self.sizes)):
             st["options"][o[i]:o[i + 1]] += np.bincount(b["action"][b["realized"][:, i], i], minlength=self.sizes[i])
