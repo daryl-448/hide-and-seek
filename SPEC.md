@@ -608,12 +608,13 @@ Reported, not gated:
 
 Otherwise the report says "adaptation shown, co-evolution not identified".
 
-**Repair cycle 2 of the launderer learner (ours; declared 2026-11-11, before its runs; the last cycle §16 allows).** The full declaration, with every cell, world, gate and the selection rule, is the docstring of `hns.marl.repair2`. In short:
+**Repair cycle 2 of the launderer learner (ours; declared 2026-11-11, before its runs).** The full declaration, with every cell, world, gate and the selection rule, is the docstring of `hns.marl.repair2`. In short:
 - **Why.** Under the per-proceeds reward the launderer found a profitable policy against a frozen inspector and then lost it (reports/m5_capability.md). In the saved networks almost every unit of the head's trunk is inactive, so most idle states get identical Q-values; the shared `V` mis-values a launch's options; and the soft target adds an entropy bonus. Role-Q dropout 0.5 diverged and is set to 0.
 - **Cells.** A 2 × 2 × 2 factorial with a LeakyReLU(0.01) trunk: shared or per-branch `V`; soft or hard root target; the 100k FIFO replay or an 80k FIFO plus a 20k lifetime reservoir that supplies 25 % of each batch. Four controls: the legacy learner (ReLU trunk); a branch-weighted loss; a Huber-tailed loss; a LayerNorm on the readout before the trunk. That is 12 cells against 2 frozen M5 opponents (Full seed 0, NDA seed 1), 30 worlds each, seed 0. The reward, the action set and the simulator do not change.
 - **Gates**, on 8 held-out worlds never used before, against both opponents. P1: no numerical abort, closed BTC accounting, at most 1 % of a fixed panel's states with an all-zero trunk output, and calibrated values (acceptance item 2 above). P2: the natural policy's reward and BTC utility are each at least half of scripted `direct` at 50 % once per episode, and above waiting with a paired 95 % interval. P3: with one scheduled launch per episode, the network's option choices beat uniform ones by at least 0.02 BTC utility, with a paired 95 % interval above 0. Launching more than once per episode is not penalized.
 - **Selection.** The passing cell with the highest worst-opponent natural BTC utility; within 0.02, the simplest in a fixed order. Then **confirmation**: two fresh launderer seeds, 8 further held-out worlds, the same gates on per-world means over the three seeds, skill in at least 2 of 3 seeds, and the final network within 0.05 BTC utility of its own world-16 or world-24 snapshot (paired 95 % interval). Then one short live pilot with all three roles learning.
-- **Outcome.** A pass fixes the selected learner in this section and in §13, and the six runs are repeated. A failure at any step invokes §16's stop rule. No cell, checkpoint or temperature is chosen from a training curve.
+- **Outcome.** A pass fixes the selected learner in this section and in §13, and the six runs are repeated. A failure at any step ends the cycle, and a new one is declared before anything else runs (§16). No cell, checkpoint or temperature is chosen from a training curve.
+- **Stage 0, before the screen.** The legacy learner alone is trained against both opponents with the cycle's snapshots and diagnostics. No fix is tested. `timeline` then reads, on two further held-out worlds, whether the trunk went inactive before the policy was lost. If the policy is lost while the trunk is still active, the trunk is not the cause, and the cells are revised before the screen.
 
 ## 11. Transfer protocol
 
@@ -762,8 +763,8 @@ The total is about 25 A30-hours. M5's 2.5 h per run is an estimate: measure it o
     1. Freeze innocents to their scripted routes, so only two roles learn.
     2. Then shrink the strategy set.
     3. Then raise or lower the detector budget range.
-  - Each repair cycle is declared in advance. It ends with the capability test and a short live pilot before any full re-run. Cycle 1 (2026-11-10: the root target, γ per sub-step, the per-proceeds reward) did not pass the capability test. Cycle 2 is declared in §10 and is the last.
-  - **Stop rule.** After two repair cycles without passing the §10 acceptance, stop tuning. Run M6/M7 with the static (NMAI) pretraining against T0, report the co-trained detectors as an exploratory arm, and report Q3 as "co-evolution not identified". Never choose an M5 variant or checkpoint after seeing an M7 target-test result.
+  - Each repair cycle is declared in advance. It ends with the capability test and a short live pilot before any full re-run. Cycle 1 (2026-11-10: the root target, γ per sub-step, the per-proceeds reward) did not pass the capability test. Cycle 2 is declared in §10.
+  - **No stop rule** (removed 2026-11-11 at the user's direction; the first revision stopped after two cycles). Repair cycles continue until the §10 acceptance passes. Each is declared in advance and reported, whatever its outcome. Never choose an M5 variant or checkpoint after seeing an M7 target-test result.
 
   Report which fallbacks were used.
 - **The simulator detector wins trivially** (detection > 0.95 from early on). The launderers are too weak. Widen `k` or the hop limit, or lower `b`.

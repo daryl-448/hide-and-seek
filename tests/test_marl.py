@@ -929,6 +929,25 @@ def test_repair2_gates_and_the_selection_rule():
     assert r2.choose(r)["cell"] is None
 
 
+def test_repair2_stage0_reads_which_came_first():
+    from hns.marl.repair2 import read_timeline
+
+    alive, dead = {w: 0.1 for w in range(1, 31)}, {w: (0.1 if w < 20 else 0.8) for w in range(1, 31)}
+    held = {w: 0.4 for w in range(15, 31)}
+    lost = {w: (0.4 if w < 25 else 0.1) for w in range(15, 31)} | {22: 0.45}
+    r = read_timeline(dead, lost)
+    assert (r["collapse"], r["best"], r["loss"], r["reading"]) == (20, 22, 25, "trunk first")
+    assert read_timeline(alive, lost)["reading"] == "policy first" and read_timeline(alive, lost)["collapse"] is None
+    late = {w: (0.1 if w < 28 else 0.8) for w in range(1, 31)}
+    assert read_timeline(late, lost) | {"blind_final": 0} == r | {"collapse": 28, "reading": "policy first", "blind_final": 0}
+    assert read_timeline(dead, held)["reading"] == "no loss" and read_timeline(dead, held)["loss"] is None
+    dip = lost | {30: 0.3}                                      # a dip that recovers by world 30 is not a loss
+    assert read_timeline(dead, dip)["reading"] == "no loss"
+    flicker = dead | {3: 0.9, 24: 0.2}                          # only the last unbroken stretch counts as a collapse
+    assert read_timeline(flicker, lost)["collapse"] == 25
+    assert read_timeline(dead | {30: 0.2}, lost)["collapse"] is None
+
+
 def test_repair2_an_aborted_confirmation_seed_fails_the_cycle(tmp_path, monkeypatch):
     from hns.marl import repair2 as r2
 

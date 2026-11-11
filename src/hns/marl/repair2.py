@@ -1,7 +1,9 @@
-"""Repair cycle 2 of the launderer learner: the last one the SPEC allows (§10, §16).
+"""Repair cycle 2 of the launderer learner (SPEC §10, §16).
 
 Declared on 2026-11-11, before any of its runs. Sources: the second Sol consult (runs/sol_consult/CONSULT2.md,
 section C) and reports/m5_capability.md. Everything below is fixed in advance: cells, worlds, gates, selection.
+Amended the same day, before any run had finished: stage 0 was added, and the SPEC's stop rule was removed at
+the user's direction, so a failed cycle is followed by a new declared one.
 
 **Why.** Under the per-proceeds reward the launderer learner found a profitable policy and lost it. In the saved
 dropout-0 networks almost every unit of the head's trunk is inactive (2 to 6 of 128 fire), so most idle states
@@ -32,6 +34,23 @@ Every declared run trains its 30 worlds, in the order ``RUN_ORDER``, unless it a
 gradient, a non-finite Q at a feasible option of any state it acts in (training or evaluation) or of the panel,
 or ``|Q| > 10,000`` over the fixed panel at two consecutive checks 100 updates apart. An aborted run is a failed
 cell. Nothing is restarted with other settings.
+
+**Stage 0, before the screen.** Cell ``A`` alone, against both opponents: the legacy learner with this cycle's
+snapshots and diagnostics. No fix is tested, and the two runs are the screen's ``A`` runs. Question: is the
+trunk already inactive when the policy is lost? ``timeline`` plays every snapshot from world 15 on two further
+held-out worlds (``EVAL_SALT`` with j = 400 and 401, used for nothing else) and reads, per run:
+
+- collapse: the first world from which, through world 30, at least half of the panel's idle states have no trunk
+  unit firing;
+- loss: with ``U`` the snapshots' natural BTC utility (sampled policy) and ``U*`` its maximum, at the earliest
+  such world: if the world-30 snapshot has ``U <= U* - 0.25``, the first world after the best one with
+  ``U <= U* - 0.25``; otherwise there is no loss;
+- the reading: ``no loss``; ``trunk first`` if there is a collapse at or before the loss; else ``policy first``.
+
+``trunk first`` in every run that has a loss: the screen runs as declared. ``policy first`` in any run: the
+trunk is not what loses the policy there, and the cells are revised before the screen. ``no loss`` in both runs:
+the legacy failure did not recur, which is reported before anything else runs. The panel's share of idle states
+whose best strategy is ``direct`` is printed next to it, as a second view of the policy on fixed states.
 
 **Logs.** Per world, in ``metrics.jsonl`` (``hns.marl.train``): rewards (also discounted), where the proceeds
 went, launderer decisions by state and outcome, launches by strategy x amount x change, the learner's sampled
@@ -89,7 +108,7 @@ paired 95 % t-interval above -0.05. The cycle passes if all hold against both op
 **After a pass**, one short live pilot (20 worlds per ecosystem, all three roles learning, from the selected
 seed-0 launderer and the M5 final inspector and innocents; world seeds 900 and 901; at most 4 h of local GPU
 time), judged on P2 and P3 against its own final opponents. Only then the six-run re-run (SPEC §15). If the screen,
-the confirmation or the pilot fails, the stop rule of §16 applies: no further tuning.
+the confirmation or the pilot fails, the cycle has failed, and a new cycle is declared before anything else runs.
 
 **Not gated, reported:** the argmax policy; behaviour temperatures 0.005 and 0.03 on worlds 100 and 101 for the
 selected cell and ``A`` (``sweep``); the initial and the world 16 / 24 snapshots on worlds 100 and 101.
@@ -107,6 +126,7 @@ Usage::
     python -m hns.marl.repair2 panel --opp full0
     python -m hns.marl.repair2 refs --opp full0 --worlds selection
     python -m hns.marl.repair2 train --cell IHF --opp full0 [--seed 0]
+    python -m hns.marl.repair2 timeline --cell A --opp full0
     python -m hns.marl.repair2 select
     python -m hns.marl.repair2 confirm-eval --opp full0 --seed 1
     python -m hns.marl.repair2 confirm
@@ -166,6 +186,8 @@ WORLDS, EPS_EPISODES = 30, 150
 PANELS = {"selection": tuple(range(100, 108)), "confirmation": tuple(range(200, 208))}
 PANEL_WORLDS, PANEL_STATES = (300, 301), 256           # the diagnostic panel: 256 idle + 256 in-flight states
 SNAP_REF = (16, 24)
+TIMELINE_WORLDS, TIMELINE_FROM = (400, 401), 15         # stage 0: every snapshot from world 15, on two worlds
+COLLAPSE, LOSS = 0.5, 0.25                              # share of idle panel states; BTC utility below the best
 REFS = ("wait", "uniform", "direct50", "repeat50")
 Q_ABORT, CHECK_EVERY = 1e4, 100
 DEAD_MAX, ACCT_MAX, SKILL_MIN, TIE, RETAIN = 0.01, 1e-6, 0.02, 0.02, 0.05
@@ -617,6 +639,53 @@ def cmd_sweep(a) -> None:
     (out / "sweep.json").write_text(json.dumps(ev, indent=1))
 
 
+# ---------------------------------------------------------------------------- stage 0: the timeline
+def read_timeline(blind: dict[int, float], utility: dict[int, float]) -> dict:
+    """Stage 0's reading of one run. ``blind``: per training world, the share of the panel's idle states with no
+    trunk unit firing. ``utility``: per snapshot world, its natural BTC utility on the timeline worlds."""
+    last = max(blind)
+    collapse = None
+    for w in sorted(blind, reverse=True):                      # the start of the last unbroken stretch to the end
+        if blind[w] < COLLAPSE:
+            break
+        collapse = w
+    best = min(utility, key=lambda w: (-utility[w], w))
+    loss = None
+    if utility[max(utility)] <= utility[best] - LOSS:
+        loss = min(w for w in utility if w > best and utility[w] <= utility[best] - LOSS)
+    reading = "no loss" if loss is None else "trunk first" if collapse is not None and collapse <= loss else "policy first"
+    return {"collapse": collapse, "best": best, "best_utility": utility[best], "final_utility": utility[max(utility)],
+            "loss": loss, "reading": reading, "blind_final": blind[last]}
+
+
+def cmd_timeline(a) -> None:
+    out = run_dir(a.cell, a.opp, a.seed)
+    diag = [json.loads(x) for x in (out / "diag.jsonl").read_text().splitlines()]
+    epochs = {r["world"] + 1: r for _, r in mt.read_records(out / "metrics.jsonl") if r["kind"] == "epoch"}
+    tr = make(a.cell, a.opp, a.seed, torch.device(a.device))
+    util = {}
+    for w in range(TIMELINE_FROM, WORLDS + 1):
+        if (out / "snap" / f"w{w:02d}.pt").exists():           # an aborted run has snapshots up to its abort
+            load_snapshot(tr, out / "snap" / f"w{w:02d}.pt")
+            util[w] = float(np.mean([r["btc_utility"] for r in evaluate(tr, "boltzmann", TIMELINE_WORLDS)]))
+    res = read_timeline({d["world"]: d["panel"]["no_unit_share_idle"] for d in diag if d["world"] >= 1}, util)
+    res["rows"] = [{"world": d["world"], "units_active": d["panel"]["units_active"],
+                    "blind_idle": d["panel"]["no_unit_share_idle"], "direct_argmax": d["panel"]["direct_argmax_share"],
+                    "direct_margin_tau": d["panel"]["direct_margin_tau"], "modal_row": d["panel"]["modal_row_share"],
+                    "train_utility": epochs[d["world"]]["btc_utility"],
+                    "train_direct": epochs[d["world"]]["strategy_share"]["direct"], "utility": util.get(d["world"])}
+                   for d in diag if d["world"] >= 1]
+    (out / "timeline.json").write_text(json.dumps(res, indent=1))
+    print(f"{out.name}: world | units firing | blind idle states | direct is best (panel) | margin (tau) | "
+          f"training utility, direct share | snapshot utility on worlds {TIMELINE_WORLDS}")
+    for r in res["rows"]:
+        u = "" if r["utility"] is None else f"{r['utility']:+.3f}"
+        print(f"  {r['world']:2d} | {r['units_active']:3d} | {r['blind_idle']:.2f} | {r['direct_argmax']:.2f} | "
+              f"{r['direct_margin_tau']:+7.1f} | {r['train_utility']:+.3f}, {r['train_direct']:.2f} | {u}")
+    print(f"collapse: world {res['collapse']}; best snapshot: world {res['best']} ({res['best_utility']:+.3f}); "
+          f"loss: world {res['loss']}; final {res['final_utility']:+.3f}; reading: {res['reading']}")
+
+
 # ---------------------------------------------------------------------------- gates
 def _col(rows: list[dict], key: str) -> np.ndarray:
     return np.array([r[key] for r in rows], np.float64)
@@ -812,15 +881,16 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     cmds = {"panel": cmd_panel, "refs": cmd_refs, "train": cmd_train, "confirm-eval": cmd_confirm_eval,
-            "sweep": cmd_sweep, "select": cmd_select, "confirm": cmd_confirm, "report": cmd_report}
+            "sweep": cmd_sweep, "timeline": cmd_timeline, "select": cmd_select, "confirm": cmd_confirm,
+            "report": cmd_report}
     for name in cmds:
         p = sub.add_parser(name)
-        if name in ("panel", "refs", "train", "confirm-eval", "sweep"):
+        if name in ("panel", "refs", "train", "confirm-eval", "sweep", "timeline"):
             p.add_argument("--opp", choices=list(OPPS), required=True)
             p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-        if name in ("train", "sweep"):
+        if name in ("train", "sweep", "timeline"):
             p.add_argument("--cell", choices=list(CELLS), required=True)
-        if name in ("train", "confirm-eval", "sweep"):
+        if name in ("train", "confirm-eval", "sweep", "timeline"):
             p.add_argument("--seed", type=int, default=0)
         if name in ("train", "refs", "confirm-eval"):
             p.add_argument("--eval-worlds", type=int, help="fewer evaluation worlds: a smoke run, never a result")
