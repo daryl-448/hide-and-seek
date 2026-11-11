@@ -1113,6 +1113,7 @@ def test_stage1_cells_offline_fit_and_choice():
 
     assert r2.STAGE_CELLS["P"] == r2.CELLS["A"] | {"scale": "wealth"} and r2.STAGE_CELLS["I"] == r2.CELLS["A"] | {
         "baseline": "independent"} and not set(r2.STAGE_CELLS) & set(r2.CELLS)
+    assert r2.STAGE_CELLS["J"] == r2.CELLS["A"] | {"critic": "joint", "backup": "hard", "trunk_act": "leaky"}
     for c in r2.STAGE_CELLS.values():
         MarlConfig(**c)
     torch.manual_seed(0)
@@ -1179,7 +1180,7 @@ def test_stage1_reading_of_a_run_and_the_gate_table():
         cal = {"n": 10, "bias_soft": bias, "g_abs_soft": 0.4, "q_max": 1.0}
         return [{"world": j, "btc_utility": x, "reward": x, "cal": cal} for j, x in zip(s1.DEV_WORLDS, u)]
 
-    ok = {"status": "ok", "accounting_gap_max": 0.0, "zero_trunk_share": 0.0}
+    ok = {"cell": "P", "status": "ok", "accounting_gap_max": 0.0, "zero_trunk_share": 0.0}
     a_final, d50 = rows([0.1] * 4), rows([0.6] * 4)
     good = {20: rows([0.5, 0.5, 0.5, 0.5]), 30: rows([0.52, 0.48, 0.5, 0.46])}
     r = s1.read_run(ok, good, a_final, d50)
@@ -1192,8 +1193,16 @@ def test_stage1_reading_of_a_run_and_the_gate_table():
     r = s1.read_run(ok, lost, a_final, d50)
     assert r["c2"] and not r["c3"] and not r["promising"]
     assert not s1.read_run(ok, {20: good[20], 30: rows([0.5] * 4, bias=0.7)}, a_final, d50)["c4"]
-    for res, snaps in (({"status": "aborted: x"}, None), (ok, None)):
+    for res, snaps in (({"cell": "P", "status": "aborted: x"}, None), (ok, None)):
         assert s1.read_run(res, snaps, a_final, d50)["promising"] is False
+    # the joint critic: a hard target is calibrated on the argmax policy's plain return, and a blind network fails
+    okj = ok | {"cell": "J", "modal_row_share": 0.01}
+    hard = lambda bias: [r | {"cal": {"n": 10, "bias_hard": bias, "g_abs_hard": 0.4, "q_max": 1.0}} for r in rows([0.5] * 4)]  # noqa: E731
+    r = s1.read_run(okj, good, a_final, d50, hard(0.1))
+    assert r["promising"] and r["calibration"]["kind"] == "hard"
+    assert not s1.read_run(okj, good, a_final, d50, hard(0.7))["c4"]
+    assert not s1.read_run(okj | {"modal_row_share": 0.5}, good, a_final, d50, hard(0.1))["c1"]
+    assert s1.read_run(ok | {"modal_row_share": 0.5}, good, a_final, d50)["c1"]              # cell P: as step 2 declares
     assert [x["world"] for x in s1._dev(rows([1, 2, 3, 4])[::-1] + [{"world": 104}])] == list(s1.DEV_WORLDS)
     d, half = r2.STRATEGIES.index("direct"), r2.AMOUNTS.index(0.5)
     dec = [(0, 1, r2.GO, 0.0, (0.0, 0.1, 0.0, True, 0.5, d, half)), (1, 1, r2.WAIT, 0.0, (0.0, 0.1, 0.0, True, 3.5, 2, half)),
@@ -1241,6 +1250,173 @@ def test_stage1_block_is_one_attempt(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         r2.cmd_train(T)
 
+
+
+# ---------------------------------------------------------------------------- stage 1: the joint launch critic
+def _joint_inputs(n=6):
+    from hns.models.qnet import JointHeads
+
+    torch.manual_seed(1)
+    br = BRANCHES["launderer"]
+    H = JointHeads(12, br, {"recipient": D_CAND})
+    sl = H._slices()
+    masks = torch.ones(n, sum(br.values()), dtype=torch.bool)
+    masks[0, sl["amount"]] = torch.tensor([True, False, True, False])
+    masks[1, 1] = False                                         # no launch is feasible
+    masks[2, sl["recipient"].start + 3:sl["recipient"].stop] = False
+    masks[4, sl["mules"].start + 1] = False
+    idle = torch.tensor([True, True, True, False, True, True][:n])
+    return H, sl, masks, idle, torch.randn(n, 12), torch.randn(n, K_RECIPIENTS, D_CAND)
+
+
+def test_joint_critic_values_complete_actions():
+    H, sl, masks, idle, h, cand = _joint_inputs()
+    parts = root, u, a = H.parts(h, masks, cand, idle)
+    assert H.table == ["amount", "strategy", "mules", "change"] and H.n_modes == 144 and u.shape == (6, 144)
+    go = u.max(1).values
+    assert torch.equal(root[[0, 2, 4, 5], 1], go[[0, 2, 4, 5]]) and root[1, 1] == NEG                    # idle: the best launch
+    z = H.trunk(h)
+    assert torch.equal(root[3], H.root(z)[3]) and torch.equal(root[:, 0], H.root(z)[:, 0])        # in flight: proceed
+    assert (a.max(1).values == 0).all() and (a[2, 3:] == NEG).all() and torch.isfinite(a[2, :3]).all()
+    # a mode is feasible if each of its options is; row 0 has 2 of 4 amounts, row 4 one of 2 mule options
+    assert torch.isfinite(u[0]).sum() == 72 == torch.isfinite(u[4]).sum() and torch.isfinite(u[5]).all()
+    q = H(h, masks, cand, idle)
+    assert q.shape == masks.shape and (q[~masks] == NEG).all() and torch.isfinite(q[masks]).all()
+    for b in H.names[1:]:                                       # every branch's best option belongs to the best launch
+        assert torch.allclose(q[:, sl[b]].max(1).values, go)
+    act = torch.stack([q[:, sl[b]].argmax(1) for b in H.names], 1)
+    assert torch.equal(H.mode_of(act), u.argmax(1)) and torch.equal(act[:, H.names.index("recipient")], a.argmax(1))
+    # the value of a complete action: wait, proceed, or U(mode) + A(recipient)
+    act[:, 0] = 1
+    k = act[:, H.names.index("recipient")].clone()
+    k[5] = (k[5] + 1) % K_RECIPIENTS                            # a worse recipient costs its advantage
+    act[:, H.names.index("recipient")] = k
+    v = H.taken(parts, act, idle)
+    assert torch.allclose(v[[0, 2, 4]], go[[0, 2, 4]]) and v[3] == root[3, 1]
+    assert torch.allclose(v[5], go[5] + a[5, k[5]]) and v[5] < go[5]
+    act[:, 0] = 0
+    assert torch.equal(H.taken(parts, act, idle), root[:, 0])
+    m = torch.tensor([[0, 3, 0, 8, 1, 1], [0, 0, 0, 0, 0, 0], [0, 2, 5, 4, 1, 0]])       # amount, strategy, mules, change
+    assert H.mode_of(m).tolist() == [143, 0, ((2 * 9 + 4) * 2 + 1) * 2 + 0]
+    # the greedy action decodes ONE best mode: with two tied best modes that differ in two branches, the best option
+    # of each branch on its own would mix them into a third mode that is not a best one
+    ones, yes = torch.ones(1, 35, dtype=torch.bool), torch.tensor([True])
+    u2 = torch.zeros(1, 144)
+    tie = torch.tensor([[1, 0, 0, 1, 0, 0], [1, 1, 0, 0, 0, 0]])                          # (amount 0, strategy 1), (1, 0)
+    u2[0, H.mode_of(tie)] = 10.0
+    p2 = (torch.tensor([[0.0, 10.0]]), u2, torch.zeros(1, K_RECIPIENTS))
+    lay = H.layout(p2, ones)
+    mixed = torch.stack([lay[:, sl[b]].argmax(1) for b in H.names], 1)
+    assert u2[0, H.mode_of(mixed)] == 0.0                                                 # the mixture is worth 0
+    g = H.best(p2)
+    assert u2[0, H.mode_of(g)] == 10.0 and g[0, 0] == 1 and H.taken(p2, g, yes) == 10.0
+    # every feasible complete action is checked, not only the best launch per option
+    fin, top = H.check(p2, ones, yes)
+    assert fin and top == 10.0
+    u3 = u2.clone()
+    u3[0, 7] = -20001.0
+    assert H.layout((p2[0], u3, p2[2]), ones)[0].abs().max() == 10.0                       # the per-branch view hides it
+    fin, top = H.check((p2[0], u3, p2[2]), ones, yes)
+    assert fin and top == 20001.0
+    a3 = torch.zeros(1, K_RECIPIENTS)
+    a3[0, 5] = -7.0                                             # the worst launch: the worst mode at the worst recipient
+    assert H.check((p2[0], u3, a3), ones, yes)[1] == 20008.0
+    u3[0, 7] = NEG
+    assert not H.check((p2[0], u3, p2[2]), ones, yes)[0]
+    no_amount = ones.clone()
+    no_amount[0, sl["amount"].start + 1:sl["amount"].stop] = False                        # but infeasible modes may be -inf
+    u4 = u2.masked_fill(~H.mode_mask(no_amount), NEG)
+    assert H.check((p2[0], u4, p2[2]), no_amount, yes)[0] and H.mode_mask(no_amount).sum() == 36
+    assert H.check((torch.tensor([[0.0, 3.0]]), u2, p2[2]), ones, torch.tensor([False]))[1] == 3.0    # in flight: the root alone
+
+
+def test_joint_learner_trains_the_taken_action_on_a_double_hard_target(tmp_path, monkeypatch):
+    from hns.marl import learner as lm
+
+    kw = dict(critic="joint", backup="hard", trunk_act="leaky", design_roles="launderer")
+    tr = _trainer(tmp_path, monkeypatch, "nda", episodes=4, **kw)
+    tr.run()                                                    # the env checks every action's feasibility
+    L, inn = tr.roles["launderer"], tr.roles["innocent"]
+    assert L.joint and not inn.joint and type(L.net.heads).__name__ == "JointHeads"
+    e = tr.epochs[-1]
+    st = e["learner"]["launderer"]
+    assert st["n"] > 0 and all(math.isfinite(v) for v in e["losses"].values()) and abs(e["accounting_gap"]) < 1e-9
+    assert math.isclose(sum(st["loss_coef"].values()) - sum(list(st["loss_coef"].values())[2:]), 1.0, abs_tol=1e-9)
+    b = L.buf.sample(tr.cfg.batch, np.random.default_rng(5))
+    ob, nxt = collate(b["obs"]), collate(b["next_obs"])
+    H = L.net.heads
+    action, realized = torch.from_numpy(b["action"]), torch.from_numpy(b["realized"])
+    with torch.no_grad():
+        (root, u, a), idle = L._parts(L.net, nxt, b["next_masks"])
+        (root_t, u_t, a_t), _ = L._parts(L.targ, nxt, b["next_masks"])
+        launch = u_t.gather(1, u.argmax(1, keepdim=True))[:, 0] + a_t.gather(1, a.argmax(1, keepdim=True))[:, 0]
+        v2 = torch.where(root.argmax(1) == 0, root_t[:, 0], torch.where(idle, launch, root_t[:, 1]))
+        y = torch.from_numpy(b["reward"]).clone()
+        y[torch.from_numpy(~b["done"])] += torch.from_numpy(tr.cfg.gamma ** b["gap"].astype(np.float64)).float() * v2
+        assert torch.allclose(L.batch_target(b), y, atol=1e-5)
+        parts, idle0 = L._parts(L.net, ob, b["masks"])
+        want = ((y - H.taken(parts, action, idle0)) ** 2).mean().item()
+        qa = L.taken_q(L.net, ob, b["masks"], action, realized)
+        assert torch.equal(qa != 0, realized & (qa != 0)) and torch.allclose(qa[:, 0], H.taken(parts, action, idle0))
+    assert math.isclose(L.update(np.random.default_rng(5)), want, rel_tol=1e-4)
+    # acting: at epsilon 0 and a tiny temperature it is the best complete action; at epsilon 1 every branch is uniform
+    masks = b["masks"]
+    q = L.q_values(ob, masks)
+    o = np.concatenate([[0], np.cumsum(L.sizes)])
+    got = L.act(ob, masks, 0.0, np.random.default_rng(0), tau=1e-6)
+    rows = np.arange(len(q))
+    for i in range(len(L.sizes)):                               # (candidates with equal features tie: compare values)
+        assert np.allclose(q[rows, o[i] + got[:, i]], q[:, o[i]:o[i + 1]].max(1), atol=1e-5)
+    rnd = np.concatenate([L.act(ob, masks, 1.0, np.random.default_rng(s)) for s in range(40)])
+    assert all(len(set(rnd[:, i])) == int(masks[:, o[i]:o[i + 1]].any(0).sum()) for i in range(1, len(L.sizes)))
+    assert all(masks[np.tile(rows, 40), o[i] + rnd[:, i]].all() for i in range(len(L.sizes)))      # and feasible
+    # a non-finite value of one mode stops acting, though the best launch per option stays finite
+    with torch.no_grad():
+        keep = L.net.heads.modes.bias[7].item()
+        L.net.heads.modes.bias[7] = -30000.0
+    assert L.q_abs_max(ob, masks) >= 20000 and np.abs(L.q_values(ob, masks)[masks]).max() < 100
+    with torch.no_grad():
+        L.net.heads.modes.bias[7] = float("nan")
+    for call in (lambda: L.q_values(ob, masks), lambda: L.act(ob, masks, 0.0, np.random.default_rng(0)),
+                 lambda: L.best(ob, masks), lambda: L.q_abs_max(ob, masks)):
+        with pytest.raises(FloatingPointError):
+            call()
+    with torch.no_grad():
+        L.net.heads.modes.bias[7] = keep
+    assert (L.best(ob, masks) == np.asarray(H.best(L._parts(L.net, ob, masks)[0]))).all()
+    for bad in (dict(critic="joint"), kw | {"scale": "wealth"}, kw | {"baseline": "independent"}, dict(critic="tuple")):
+        with pytest.raises(ValueError):
+            MarlConfig(**bad)
+    with pytest.raises(ValueError):                             # not defined for innocents
+        _trainer(tmp_path, monkeypatch, "nda", episodes=2, critic="joint", backup="hard", trunk_act="leaky", out_name="both")
+
+
+def test_joint_critic_plays_and_is_diagnosed_like_the_others(tmp_path, monkeypatch):
+    from hns.marl import capability as cap, repair2 as r2
+
+    tr = _trainer(tmp_path, monkeypatch, "nda", episodes=2, learn=("launderer",),
+                  fixed_eps={"innocent": 0.05, "detector": 0.05}, design_roles="launderer",
+                  **{k: v for k, v in r2.STAGE_CELLS["J"].items()})
+    monkeypatch.setattr(r2, "EPISODES", 2)
+    monkeypatch.setattr(r2, "SUBSTEPS", 12)
+    monkeypatch.setattr(r2, "draw_world", lambda c, rng: c)
+    monkeypatch.setattr(cap, "LAUNCH_LAST", 3)
+    tr.run_world()
+    a1, a2 = (r2.play(tr, r2.Net(tr, "argmax"), 100) for _ in range(2))
+    assert a1 == a2 and abs(a1["accounting_gap"]) < 1e-9
+    b = r2.play(tr, r2.Net(tr, "boltzmann"), 100)
+    assert b["cal"]["n"] > 0 and set(b["gate"]) == {"low", "mid", "high"}
+    m = r2.play(tr, r2.Net(tr, "matched", sched=np.random.default_rng(0)), 100)
+    assert math.isclose(m["tranches"], 1.0)
+    col = r2._Collect(tr, cap.Scheduled(np.random.default_rng(0), max_launches=3))
+    r2.play(tr, col, 300)
+    idle = np.array([o[4][0] == 0 for o, _ in col.rows])
+    diag = r2.Diagnostics(tr, {"obs": [o for o, _ in col.rows], "masks": np.stack([k for _, k in col.rows]), "idle": idle,
+                               "bal": np.array([o[4][1] for o, _ in col.rows], np.float32)})
+    st = diag.panel_stats()
+    assert st["zero_trunk_share"] == 0.0 and 0 < st["modal_row_share"] <= 1 and math.isfinite(st["direct_margin_tau"])
+    g = diag.grad_stats()
+    assert g is None or len(g["residual_abs"]["initiate"]) == 3
 
 
 def test_kind_values_agree():

@@ -158,7 +158,6 @@ import yaml
 import hns.marl.capability as cap
 import hns.marl.train as mt
 from hns.marl.obs import collate, launderer_obs, pack_masks
-from hns.models.qnet import sample_actions, taken
 from hns.sim.entities import AMOUNTS, GO, STRATEGIES, WAIT
 from hns.sim.env import SimEnv
 from hns.sim.live import LiveGraph
@@ -187,7 +186,9 @@ CELLS = {
     "LN": _cell("independent", "hard", "fifo", head_norm=True),
 }
 # one-factor variants of the legacy learner for the staged tests (hns.marl.stage1); not cells of the screen
-STAGE_CELLS = {"P": CELLS["A"] | {"scale": "wealth"}, "I": CELLS["A"] | {"baseline": "independent"}}
+STAGE_CELLS = {"P": CELLS["A"] | {"scale": "wealth"}, "I": CELLS["A"] | {"baseline": "independent"},
+               # the joint critic is a bundle, not one factor: its own head, a leaky trunk, a hard double target
+               "J": CELLS["A"] | {"critic": "joint", "backup": "hard", "trunk_act": "leaky"}}
 ALL_CELLS = CELLS | STAGE_CELLS
 RUN_ORDER = ("A", "SSF", "IHF", "IHR", "SHF", "ISF", "SSR", "SHR", "ISR", "W", "H", "LN")
 SIMPLEST_FIRST = ("IHF", "A", "SSF", "ISF", "SHF", "SSR", "ISR", "SHR", "IHR", "W", "H", "LN")
@@ -237,15 +238,11 @@ class Net:
         ob = launderer_obs(env, tr.fz, ids, tr.gvec, tr.view_seed(1), tr.cfg.k2)
         masks, _ = pack_masks("launderer", states, ids)
         q = L.q_values(ob, masks)
-        if self.mode == "argmax":
-            o = np.concatenate([[0], np.cumsum(L.sizes)])
-            a = np.stack([q[:, o[i]:o[i + 1]].argmax(1) for i in range(len(L.sizes))], axis=1)
-        else:
-            a = sample_actions(q, L.sizes, self.tau, 0.0, tr.rng)
+        greedy = L.best(ob, masks, q)
+        a = greedy.copy() if self.mode == "argmax" else L.act(ob, masks, 0.0, tr.rng, tau=self.tau)
         if self.mode == "matched" and env.episode != self.ep:
             self.ep, self.launched = env.episode, set()
             self.when = {x.id: int(self.sched.integers(0, cap.LAUNCH_LAST + 1)) for x in env.launderers}
-        o = np.concatenate([[0], np.cumsum(L.sizes)])
         bs, ba = list(L.branches).index("strategy"), list(L.branches).index("amount")
         for j, i in enumerate(ids):
             st = states[i]
@@ -260,7 +257,7 @@ class Net:
             p /= p.sum()
             ent = 0.0 if self.mode == "argmax" else float(-(p * np.log(np.maximum(p, 1e-300))).sum())
             self.rec[(tr.step_no, i)] = (float(q[j, 0]), float(q[j, 1]), ent, idle, float(ob.x_c[j, 1]),
-                                         int(q[j, o[bs]:o[bs + 1]].argmax()), int(q[j, o[ba]:o[ba + 1]].argmax()))
+                                         int(greedy[j, bs]), int(greedy[j, ba]))
         names = list(L.branches)
         return {i: {b: int(a[j, bi]) for bi, b in enumerate(names) if b in states[i].branches}
                 for j, i in enumerate(ids)}
@@ -468,10 +465,11 @@ class Diagnostics:
         if n == self.checked or n % CHECK_EVERY:
             return
         self.checked = n
-        q = self.L.q_values(self.ob, self.masks)[self.masks]
-        if not np.isfinite(q).all():
-            raise Abort(f"non-finite Q at update {n}")
-        self.over = self.over + 1 if np.abs(q).max() > Q_ABORT else 0
+        try:
+            top = self.L.q_abs_max(self.ob, self.masks)
+        except FloatingPointError:
+            raise Abort(f"non-finite Q at update {n}") from None
+        self.over = self.over + 1 if top > Q_ABORT else 0
         if self.over >= 2:
             raise Abort(f"|Q| above {Q_ABORT:g} at two consecutive checks, update {n}")
 
@@ -507,7 +505,7 @@ class Diagnostics:
                         "max": [cell(top, i) for i in range(o[k], o[k + 1])]} for k, b in enumerate(names)}
 
         return {"q_table": table(q), "q_table_target": table(qt),
-                "q_abs_max": float(np.abs(q[self.masks]).max()),
+                "q_abs_max": L.q_abs_max(self.ob, self.masks),
                 "q_net_abs_max": float(np.abs((q / m)[self.masks]).max()), "scale_max": float(m.max()),
                 "q_wait_idle": float(root[:, WAIT].mean()),
                 "go_minus_wait_tau": float(np.median((root[:, GO] - root[:, WAIT])[np.isfinite(root[:, GO])]) / tau),
@@ -533,9 +531,8 @@ class Diagnostics:
         y = L.batch_target(b)
         L.net.train()
         ob = collate(b["obs"])
-        q = L._q(L.net, ob, b["masks"])
-        realized = torch.from_numpy(b["realized"]).to(q.device)
-        qa = taken(q, L.sizes, torch.from_numpy(b["action"]).to(q.device), realized)
+        realized = torch.from_numpy(b["realized"]).to(y.device)
+        qa = L.taken_q(L.net, ob, b["masks"], torch.from_numpy(b["action"]).to(y.device), realized)
         e = (y.unsqueeze(1) - qa) ** 2 * realized              # squared residuals in reward units
         m = L.scale_of(ob)
         e_loss = e if m is None else e / m ** 2                # what the loss weighs: divided by m(s)^2 under the scale
@@ -613,7 +610,9 @@ def cmd_train(a) -> None:
             print(f"{out.name}: {status}", flush=True)
     res = {"cell": a.cell, "opp": a.opp, "seed": a.seed, "worlds": a.worlds, "status": status, "git_sha": mt.git_sha(),
            "accounting_gap_max": max((abs(e["accounting_gap"]) for e in tr.epochs), default=0.0),
-           "zero_trunk_share": diag.panel_stats()["zero_trunk_share"] if status == "ok" else None}
+           "zero_trunk_share": None, "modal_row_share": None}
+    if status == "ok":
+        res |= {k: v for k, v in diag.panel_stats().items() if k in ("zero_trunk_share", "modal_row_share")}
     if status == "ok" and not a.no_eval:                      # a staged test evaluates with its own command
         worlds = PANELS["selection"][:a.eval_worlds]
         try:

@@ -51,6 +51,20 @@ the policy is still ``softmax(Q / tau)`` and ``y`` is unchanged; the loss fits
 ``q`` to ``y / m(s)``, which is the squared error of ``Q`` divided by
 ``m(s)^2``.
 
+``critic = "joint"`` (stage 1; launderers only) replaces the branching heads
+by :class:`hns.models.qnet.JointHeads`, a critic over complete actions. One
+value is fitted per transition, that of the action taken:
+``(y - Q(s, a))^2`` with ``a`` = wait, proceed, or the launch's mode and
+recipient. The target is hard and double: with ``a* = argmax_a Q(s', a)``
+of the online network over wait and go (go being the best launch, or proceed
+in flight), ``y = r + gamma ** gap (1 - d) Q^targ(s', a*)``, where a launch is
+valued at the online network's best mode and recipient. ``tau`` only shapes
+the behaviour policy (:meth:`RoleLearner.act`): the gate is
+``softmax((Q(wait), Q(go)) / tau)``, a launch samples its mode and its
+recipient from ``softmax(U / tau)`` and ``softmax(A / tau)``, and epsilon
+replaces the gate's choice and each launch branch's option, each on its own,
+by a uniform feasible one, as in the branching policy.
+
 **detector-T** (:class:`DetectorLearner`, the acting inspector):
 ``TD + L_DA + lambda_MARL L_adv`` in one gradient step.
 
@@ -102,7 +116,7 @@ from hns.marl.obs import (BRANCHES, D_CAND, D_W_AGENT, G_DIM, I_CTRL, L_CTRL, Fe
                           detector_obs, merge, with_kind)
 from hns.models.detector import Detector, target_rows
 from hns.models.hrg import N_REL, ViewSampler, build_relations
-from hns.models.qnet import AgentQ, GlobalQ, root_max, root_value, soft_value, taken, td_loss
+from hns.models.qnet import AgentQ, GlobalQ, root_max, root_value, sample_actions, soft_value, taken, td_loss
 from hns.sim.labels import ILLICIT, UNKNOWN
 from hns.sim.live import keep_mask
 from hns.transfer.adv import fgsm
@@ -129,6 +143,7 @@ class MarlConfig:
     replay: str = "fifo"         # fifo | archive
     td: str = "mse"              # mse | huber | branch
     scale: str = "raw"           # raw | wealth: Q = m(s) q, the loss on q (launderers only)
+    critic: str = "branch"       # branch | joint: values per branch, or per complete action (launderers only)
     design_roles: str = "launderer,innocent"
     beta: float = 0.01
     lam: float = 0.1             # lambda_MARL, preset (§8.4)
@@ -160,10 +175,15 @@ class MarlConfig:
             raise ValueError("unknown learner variant")
         if self.backup == "hard" and self.target != "root":
             raise ValueError("the hard backup is defined for the root target")
+        if self.critic not in ("branch", "joint"):
+            raise ValueError("unknown learner variant")
+        if self.critic == "joint" and (self.backup, self.trunk_act, self.baseline, self.td, self.scale, self.head_norm) != (
+                "hard", "leaky", "shared", "mse", "raw", False):
+            raise ValueError("the joint critic has a hard target and a leaky trunk, and none of the head variants")
 
     def design(self, role: str) -> dict:
         """The learner variant of ``role``: the configured one inside ``design_roles``, M5's otherwise."""
-        keys = ("baseline", "backup", "trunk_act", "head_norm", "replay", "td", "scale")
+        keys = ("baseline", "backup", "trunk_act", "head_norm", "replay", "td", "scale", "critic")
         if role in self.design_roles.split(","):
             return {k: getattr(self, k) for k in keys}
         return {k: MarlConfig.__dataclass_fields__[k].default for k in keys}
@@ -217,11 +237,12 @@ class RoleLearner:
             raise ValueError("the root target needs initiate as the first branch")
         ptr = {"recipient": D_CAND} if role == "launderer" else None
         self.design = d = cfg.design(role)
-        if d["scale"] == "wealth" and role != "launderer":
-            raise ValueError("the wealth scale is defined for launderers only")
+        if (d["scale"] == "wealth" or d["critic"] == "joint") and role != "launderer":
+            raise ValueError("the wealth scale and the joint critic are defined for launderers only")
+        self.joint = d["critic"] == "joint"
+        head = {"critic": "joint"} if self.joint else {"baseline": d["baseline"], "act": d["trunk_act"], "norm": d["head_norm"]}
         self.net = AgentQ(self.branches, 17, D_W_AGENT, L_CTRL if role == "launderer" else I_CTRL, pointer=ptr,
-                          dropout=cfg.q_dropout,
-                          head={"baseline": d["baseline"], "act": d["trunk_act"], "norm": d["head_norm"]}).to(device)
+                          dropout=cfg.q_dropout, head=head).to(device)
         self.targ = _target_of(self.net)
         _amp(cfg, self.net.enc, self.targ.enc)
         self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr)
@@ -244,14 +265,76 @@ class RoleLearner:
         m = self.scale_of(ob) if scaled else None
         return q if m is None else q * m
 
+    def _parts(self, net, ob: ObsBatch, masks: np.ndarray):
+        """The joint critic's ``((root, U, A), idle)`` (:meth:`hns.models.qnet.JointHeads.parts`)."""
+        g, f = ob.tensors(self.device)
+        return net.parts(g, f["x_tx"], f["x_w"], f["x_c"], _t(masks, self.device), _t(ob.cand, self.device))
+
+    def taken_q(self, net, ob: ObsBatch, masks: np.ndarray, action: torch.Tensor, realized: torch.Tensor) -> torch.Tensor:
+        """The value the loss fits, per realized branch, ``(B, n_branches)`` in reward units, 0 where unrealized:
+        each branch's taken option under the branching heads; under the joint critic the one ``Q(s, a)`` of the
+        complete action, repeated over its realized branches."""
+        if self.joint:
+            parts, idle = self._parts(net, ob, masks)
+            return net.heads.taken(parts, action, idle).unsqueeze(1) * realized
+        return taken(self._q(net, ob, masks), self.sizes, action, realized)
+
+    @torch.no_grad()
+    def act(self, ob: ObsBatch, masks: np.ndarray, eps: float, rng: np.random.Generator, tau: float | None = None) -> np.ndarray:
+        """The behaviour policy's option of every branch, ``(B, n_branches)``."""
+        tau = self.cfg.tau if tau is None else tau
+        if not self.joint:
+            return sample_actions(self.q_values(ob, masks), self.sizes, tau, eps, rng)
+        self.net.eval()
+        H = self.net.heads
+        root, u, a = (x.cpu().numpy() for x in self._checked(ob, masks)[0])
+        out = np.zeros((len(root), len(self.sizes)), np.int64)
+        out[:, 0] = sample_actions(root, [2], tau, eps, rng)[:, 0]
+        mode = np.unravel_index(sample_actions(u, [u.shape[1]], tau, 0.0, rng)[:, 0], H.dims)
+        o = np.concatenate([[0], np.cumsum(self.sizes)])
+        for i, b in enumerate(H.names[1:], start=1):
+            out[:, i] = sample_actions(a, [a.shape[1]], tau, 0.0, rng)[:, 0] if b == H.ptr else mode[H.table.index(b)]
+            free = np.where(masks[:, o[i]:o[i + 1]], 0.0, -np.inf)             # epsilon: this branch alone, uniformly
+            explore = rng.random(len(out)) < eps
+            out[explore, i] = sample_actions(free, [self.sizes[i]], tau, 1.0, rng)[explore, 0]
+        return out
+
+    def _checked(self, ob: ObsBatch, masks: np.ndarray):
+        """The joint critic's parts in eval mode, ``(parts, largest |Q|)``; a non-finite value of any feasible
+        complete action raises (a per-branch view of the best launches would hide a bad mode behind a good one)."""
+        self.net.eval()
+        parts, idle = self._parts(self.net, ob, masks)
+        finite, top = self.net.heads.check(parts, _t(masks, self.device), idle)
+        if not bool(finite):
+            raise FloatingPointError(f"{self.role}: non-finite Q at a feasible action")
+        return parts, float(top)
+
     @torch.no_grad()
     def q_values(self, ob: ObsBatch, masks: np.ndarray) -> np.ndarray:
-        """``Q`` of every option for acting; a non-finite value at a feasible option raises."""
+        """``Q`` of every option for acting (the joint critic's per-branch view); a non-finite value at a feasible
+        option, or at any feasible complete action of the joint critic, raises."""
         self.net.eval()
+        if self.joint:
+            return self.net.heads.layout(self._checked(ob, masks)[0], _t(masks, self.device)).cpu().numpy()
         q = self._q(self.net, ob, masks).cpu().numpy()
         if not np.isfinite(q[masks]).all():
             raise FloatingPointError(f"{self.role}: non-finite Q at a feasible option")
         return q
+
+    @torch.no_grad()
+    def q_abs_max(self, ob: ObsBatch, masks: np.ndarray) -> float:
+        """The largest ``|Q|`` over the feasible options, or over the joint critic's feasible complete actions."""
+        return self._checked(ob, masks)[1] if self.joint else float(np.abs(self.q_values(ob, masks)[masks]).max())
+
+    @torch.no_grad()
+    def best(self, ob: ObsBatch, masks: np.ndarray, q: np.ndarray | None = None) -> np.ndarray:
+        """The greedy action, ``(B, n_branches)``: each branch's best option (from ``q`` if given), or the joint
+        critic's best complete action (one best mode decoded, as its target does, not a best option per branch,
+        which ties could mix)."""
+        if self.joint:
+            return self.net.heads.best(self._checked(ob, masks)[0]).cpu().numpy()
+        q, o = self.q_values(ob, masks) if q is None else q, np.concatenate([[0], np.cumsum(self.sizes)])
+        return np.stack([q[:, o[i]:o[i + 1]].argmax(1) for i in range(len(self.sizes))], axis=1)
 
     def next_value(self, q2: torch.Tensor, next_active: torch.Tensor) -> torch.Tensor:
         """``F(s')`` of the configured target, from the target network's ``Q(s', .)``."""
@@ -264,9 +347,15 @@ class RoleLearner:
         cfg, dev = self.cfg, self.device
         y = _t(b["reward"], dev)
         if b["next_obs"]:
+            nxt = collate(b["next_obs"])
             with torch.no_grad():
-                q2 = self._q(self.targ, collate(b["next_obs"]), b["next_masks"])
-                v2 = self.next_value(q2, _t(b["next_active"], dev))
+                if self.joint:                                 # double: the online network picks, the target values
+                    H = self.net.heads
+                    parts, idle = self._parts(self.net, nxt, b["next_masks"])
+                    v2 = H.taken(self._parts(self.targ, nxt, b["next_masks"])[0], H.best(parts), idle)
+                else:
+                    q2 = self._q(self.targ, nxt, b["next_masks"])
+                    v2 = self.next_value(q2, _t(b["next_active"], dev))
             y = y.clone()
             y[_t(~b["done"], dev)] += cfg.gamma ** _t(b["gap"], dev).to(y.dtype) * v2
         return y
@@ -303,14 +392,19 @@ class RoleLearner:
         self.net.train()
         ob = collate(b["obs"])
         m = self.scale_of(ob)
-        q = self._q(self.net, ob, b["masks"], scaled=False)        # the network's output: Q, or q under the wealth scale
         action, realized = _t(b["action"], dev), _t(b["realized"], dev)
-        loss = td_loss(q, self.sizes, action, realized, y if m is None else y / m.squeeze(1), self.design["td"])
+        if self.joint:                                         # one value per transition: the taken action's
+            qa = self.taken_q(self.net, ob, b["masks"], action, realized)
+            loss = ((y - qa[:, 0]) ** 2).mean()
+        else:
+            q = self._q(self.net, ob, b["masks"], scaled=False)    # the network's output: Q, or q under the wealth scale
+            loss = td_loss(q, self.sizes, action, realized, y if m is None else y / m.squeeze(1), self.design["td"])
+            qa = taken(q, self.sizes, action, realized)
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         with torch.no_grad():
             m1 = torch.ones_like(y).unsqueeze(1) if m is None else m
-            d2 = (y.unsqueeze(1) - taken(q, self.sizes, action, realized) * m1) ** 2 * realized      # in reward units
+            d2 = (y.unsqueeze(1) - qa * m1) ** 2 * realized        # in reward units, per realized branch
             sq, sq_norm = d2.sum(0), (d2 / m1 ** 2).sum(0)
             g_enc = torch.sqrt(sum((p.grad ** 2).sum() for p in self.net.enc.parameters() if p.grad is not None))
         g = torch.nn.utils.clip_grad_norm_(self.net.parameters(), cfg.clip)
@@ -330,8 +424,12 @@ class RoleLearner:
         st["grad_enc"] += float(g_enc)
         st["grad_head"] += math.sqrt(max(g_v ** 2 - float(g_enc) ** 2, 0.0))
         r = b["realized"].astype(np.float64)
-        st["coef"] += (np.concatenate([[1.0], 0.25 * r[:, 1:].any(0)]) if self.design["td"] == "branch"
-                       else (r / r.sum(1, keepdims=True)).mean(0))
+        if self.joint:                                         # the loss is one squared error per transition:
+            launch = r[:, 1:].any(1)                             # the root's share is the rows that are no launch
+            st["coef"] += np.concatenate([[1.0 - launch.mean()], (r[:, 1:] * launch[:, None]).mean(0)])
+        else:
+            st["coef"] += (np.concatenate([[1.0], 0.25 * r[:, 1:].any(0)]) if self.design["td"] == "branch"
+                           else (r / r.sum(1, keepdims=True)).mean(0))
         st["sq"] += sq.cpu().numpy()
         st["sq_norm"] += sq_norm.cpu().numpy()
         st["m"] += float(m1.sum())

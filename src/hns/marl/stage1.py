@@ -74,6 +74,36 @@ modal row of the network's own output (so the scale cannot hide a blind network)
 balance band, how often a launch happens and which strategy and amount the network prefers where it waits. The
 ratio ``m(s') / m(s)`` is not logged.
 
+**Outcome of step 1** (2026-11-11): neither form met its bar, so by the rule no cell was chosen
+(runs/repair2/stage1_choice.json). The user then decided the next two blocks, in this order.
+
+**The joint launch critic, cell ``J``** (declared 2026-11-11 before its run; the consult's section C5, with
+departures listed). What changes: the launderer's critic (``hns.models.qnet.JointHeads``) and its target
+(``hns.marl.learner``); it is a bundle, not one factor.
+
+- Values: ``Q(wait)``; in flight ``Q(proceed)``; for a launch ``U(mode) + A(recipient) - max A``, with one output
+  per mode (amount x strategy x mules x change, 144) and the recipient scored by attention; ``Q(go) = max_mode U``.
+  So the gate compares waiting with the best launch, not with an average over launch options, and a launch trains
+  the value of the action taken, with the loss's whole weight.
+- Target: hard and double. The online network picks wait or go at ``s'`` (and the best mode and recipient); the
+  target network values that choice. ``tau`` shapes behaviour only.
+- Behaviour: the gate is ``softmax((Q(wait), Q(go)) / tau)``; a launch samples mode and recipient from
+  ``softmax(U / tau)`` and ``softmax(A / tau)``; epsilon replaces the gate's choice and each launch branch's
+  option, each on its own, by a uniform feasible one, so every option is explored as often as before.
+- Trunk: LeakyReLU(0.01). Everything else is the legacy learner's: the reward, FIFO replay, optimizer, schedule.
+- Departures from C5: the critic is joint over the four table branches and additive in the recipient, not one
+  table of 2,304 tuples; the leaky trunk is part of the bundle.
+
+One block against NDA-1 (``run``, 45-minute cap, one attempt), read like step 2, with two differences that follow
+from the design: criterion 4 compares ``Q`` with the plain return of the argmax policy (the target is hard), on
+the world-30 snapshot's argmax rollouts of the same four worlds; and criterion 1, since a leaky trunk cannot be
+all-zero, also requires that at world 30 the modal row of the network's values covers at most 5 % of the panel's
+idle states (a blind network gives one row to most of them). Promising leads to the same cell against Full-0 as
+its own block.
+
+**Cell ``P`` anyway** (the user's decision, outside step 1's rule): one block against NDA-1, read exactly as
+step 2 declares. It is exploratory: step 1 did not select it.
+
 Usage::
 
     python -m hns.marl.stage1 offline --opp full0        (and nda1)
@@ -106,7 +136,7 @@ VARIANTS = {"shared/raw": ("shared", False), "shared/wealth": ("shared", True),
             "independent/raw": ("independent", False), "independent/wealth": ("independent", True)}
 BETTER, WORSE = 0.8, 1.1                            # a measure at least 20 % lower; at most 10 % higher
 DEV_WORLDS, SNAPS = (100, 101, 102, 103), (20, 30)
-A_SLACK, RETAIN = 0.02, 0.05
+A_SLACK, RETAIN, MODAL_MAX = 0.02, 0.05, 0.05
 
 
 # ---------------------------------------------------------------------------- step 1: offline head fits
@@ -232,26 +262,31 @@ def cmd_choose(a) -> None:
 
 
 # ---------------------------------------------------------------------------- step 2: the run's reading
-def read_run(res: dict, snaps: dict | None, a_final: list[dict], direct50: list[dict]) -> dict:
+def read_run(res: dict, snaps: dict | None, a_final: list[dict], direct50: list[dict], argmax: list[dict] | None = None) -> dict:
     """The four criteria of one run. ``res``: its ``result.json``; ``snaps``: ``world -> world records`` of the
     world-20 and world-30 snapshots on ``DEV_WORLDS`` (``None`` if the run or its evaluation aborted);
-    ``a_final`` and ``direct50``: the references' records on the same worlds."""
+    ``a_final`` and ``direct50``: the references' records on the same worlds; ``argmax``: the world-30 snapshot's
+    argmax-policy records, for a cell with a hard target."""
     if res["status"] != "ok" or snaps is None:
         return {"status": res["status"], "c1": False, "c2": False, "c3": False, "c4": False, "promising": False}
     u = {w: r2._col(v, "btc_utility") for w, v in snaps.items()}
     last, first = SNAPS[-1], SNAPS[0]
     rew, ua = r2._col(snaps[last], "reward"), r2._col(a_final, "btc_utility")
     ud, rd = r2._col(direct50, "btc_utility"), r2._col(direct50, "reward")
+    cell = r2.ALL_CELLS[res["cell"]]
     c1 = res["accounting_gap_max"] <= r2.ACCT_MAX and res["zero_trunk_share"] <= r2.DEAD_MAX
+    if cell.get("critic") == "joint":
+        c1 = c1 and res["modal_row_share"] <= MODAL_MAX
     c2 = (u[last].mean() >= 0.5 * ud.mean() and rew.mean() >= 0.5 * rd.mean() and u[last].mean() > 0
           and u[last].mean() >= ua.mean() - A_SLACK)
     keep = u[last] - u[first]
-    cal = r2.calibration_gate({"boltzmann": snaps[last]}, "soft")
+    cal = r2.calibration_gate({"boltzmann": snaps[last], "argmax": argmax}, cell["backup"])
     out = {"status": "ok", "c1": bool(c1), "c2": bool(c2), "c3": bool(keep.mean() >= -RETAIN), "c4": bool(cal["ok"]),
            "utility": {str(w): float(x.mean()) for w, x in u.items()}, "reward": float(rew.mean()),
            "a_final_utility": float(ua.mean()), "direct50_utility": float(ud.mean()), "direct50_reward": float(rd.mean()),
            "retention": {"differences": keep.tolist(), "interval": list(_t95(keep))}, "calibration": cal,
-           "zero_trunk_share": res["zero_trunk_share"], "accounting_gap_max": res["accounting_gap_max"]}
+           "zero_trunk_share": res["zero_trunk_share"], "modal_row_share": res.get("modal_row_share"),
+           "accounting_gap_max": res["accounting_gap_max"]}
     return out | {"promising": bool(out["c1"] and out["c2"] and out["c3"] and out["c4"])}
 
 
@@ -284,7 +319,7 @@ def cmd_run(a) -> None:
 def read(a) -> dict:
     out = r2.run_dir(a.cell, a.opp, a.seed)
     res = json.loads((out / "result.json").read_text())
-    snaps = None
+    snaps = argmax = None
     if res["status"] == "ok":
         tr = r2.make(a.cell, a.opp, a.seed, torch.device(a.device))
         try:
@@ -292,21 +327,28 @@ def read(a) -> dict:
             for w in SNAPS:
                 r2.load_snapshot(tr, out / "snap" / f"w{w:02d}.pt")
                 snaps[w] = r2.evaluate(tr, "boltzmann", DEV_WORLDS)
+            if r2.ALL_CELLS[a.cell]["backup"] == "hard":       # the last snapshot is loaded: its argmax policy
+                argmax = r2.evaluate(tr, "argmax", DEV_WORLDS)
         except FloatingPointError as e:                        # a non-finite Q while playing: not promising
             res, snaps = res | {"status": f"aborted: {e}"}, None
     a_final = _dev(json.loads((r2.run_dir("A", a.opp, 0) / "result.json").read_text())["eval"]["boltzmann"])
-    reading = read_run(res, snaps, a_final, _dev(r2._refs(a.opp, "selection")["direct50"]))
+    reading = read_run(res, snaps, a_final, _dev(r2._refs(a.opp, "selection")["direct50"]), argmax)
+    if snaps is not None and argmax is not None:
+        reading["argmax_utility"] = float(np.mean([r["btc_utility"] for r in argmax]))
     (out / "stage1.json").write_text(json.dumps({"cell": a.cell, "opp": a.opp, "seed": a.seed, "reading": reading,
-                                                  "snaps": None if snaps is None else {str(w): v for w, v in snaps.items()}},
-                                                 indent=1))
+                                                  "snaps": None if snaps is None else {str(w): v for w, v in snaps.items()},
+                                                  "argmax": argmax}, indent=1))
     print(json.dumps(reading, indent=1))
     if snaps is not None:
-        for w, rows in snaps.items():
+        shown = {f"world {w}, sampled policy": (rows, "soft") for w, rows in snaps.items()}
+        if argmax is not None:                                 # a hard target is calibrated on these, not on the above
+            shown[f"world {SNAPS[-1]}, argmax policy"] = (argmax, "hard")
+        for name, (rows, k) in shown.items():
             gate = {b: np.sum([r["gate"][b] for r in rows], axis=0).tolist() for b in ("low", "mid", "high")}
-            cal = {k: round(float(np.mean([r["cal"][k].get("bias_soft", np.nan) for r in rows])), 3)
-                   for k in ("bal_low", "bal_mid", "bal_high")}
-            print(f"world {w}: per band [idle decisions, launches, prefers direct, prefers 50 %] {gate}; "
-                  f"Q - G by band {cal}; BTC-weighted {np.mean([r['cal']['bias_soft_btc'] for r in rows]):+.3f}")
+            cal = {b: round(float(np.mean([r["cal"][b].get(f"bias_{k}", np.nan) for r in rows])), 3)
+                   for b in ("bal_low", "bal_mid", "bal_high")}
+            print(f"{name}: per band [idle decisions, launches, prefers direct, prefers 50 %] {gate}; Q - G ({k} "
+                  f"return) by band {cal}; BTC-weighted {np.mean([r['cal'][f'bias_{k}_btc'] for r in rows]):+.3f}")
     return reading
 
 

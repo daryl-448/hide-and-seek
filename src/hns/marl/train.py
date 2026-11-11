@@ -125,7 +125,7 @@ class _AgentPolicy:
         ids = list(states)
         ob = _OBS[self.role](env, tr.fz, ids, tr.gvec, tr.view_seed(self.salt), tr.cfg.k2)
         masks, active = pack_masks(self.role, states, ids)
-        a = sample_actions(L.q_values(ob, masks), L.sizes, tr.cfg.tau, tr.eps_for(self.role), tr.rng)
+        a = L.act(ob, masks, tr.eps_for(self.role), tr.rng)
         if self.role in tr.learn:
             for j, (i, o) in enumerate(zip(ids, ob.split())):
                 oid = L.buf.add(o, masks[j], active[j], tr.step_no)
