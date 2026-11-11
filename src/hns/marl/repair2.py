@@ -187,6 +187,7 @@ CELLS = {
 }
 # one-factor variants of the legacy learner for the staged tests (hns.marl.stage1); not cells of the screen
 STAGE_CELLS = {"P": CELLS["A"] | {"scale": "wealth"}, "I": CELLS["A"] | {"baseline": "independent"},
+               "PL": CELLS["A"] | {"scale": "wealth", "trunk_act": "leaky"},
                # the joint critic is a bundle, not one factor: its own head, a leaky trunk, a hard double target
                "J": CELLS["A"] | {"critic": "joint", "backup": "hard", "trunk_act": "leaky"}}
 ALL_CELLS = CELLS | STAGE_CELLS
@@ -223,11 +224,12 @@ class Net:
     ``argmax`` takes each branch's best feasible option; ``matched`` samples the options like ``boltzmann`` but
     launches on ``sched``'s once-per-episode schedule and always proceeds in flight. Records, per decision, the
     root Q-values, the root policy's entropy, whether the launderer was idle, its log balance, and the strategy
-    and amount it values most (whether or not it launches)."""
+    and amount it values most (whether or not it launches). ``eps``: the sampled modes' exploration rate (0 in
+    every gated evaluation; the training rate for a reported look at the behaviour policy)."""
 
     def __init__(self, tr: mt.Trainer, mode: str = "boltzmann", tau: float | None = None,
-                 sched: np.random.Generator | None = None):
-        self.tr, self.mode, self.tau, self.sched = tr, mode, tr.cfg.tau if tau is None else tau, sched
+                 sched: np.random.Generator | None = None, eps: float = 0.0):
+        self.tr, self.mode, self.tau, self.sched, self.eps = tr, mode, tr.cfg.tau if tau is None else tau, sched, eps
         self.rec, self.ep, self.when, self.launched = {}, None, {}, set()
 
     def act(self, env, states: dict) -> dict:
@@ -239,7 +241,7 @@ class Net:
         masks, _ = pack_masks("launderer", states, ids)
         q = L.q_values(ob, masks)
         greedy = L.best(ob, masks, q)
-        a = greedy.copy() if self.mode == "argmax" else L.act(ob, masks, 0.0, tr.rng, tau=self.tau)
+        a = greedy.copy() if self.mode == "argmax" else L.act(ob, masks, self.eps, tr.rng, tau=self.tau)
         if self.mode == "matched" and env.episode != self.ep:
             self.ep, self.launched = env.episode, set()
             self.when = {x.id: int(self.sched.integers(0, cap.LAUNCH_LAST + 1)) for x in env.launderers}
@@ -378,14 +380,14 @@ def play(tr: mt.Trainer, lpol, j: int) -> dict:
     return out
 
 
-def evaluate(tr: mt.Trainer, policy: str, worlds, tau: float | None = None) -> list[dict]:
+def evaluate(tr: mt.Trainer, policy: str, worlds, tau: float | None = None, eps: float = 0.0) -> list[dict]:
     """``policy``: a ``Net`` mode or a reference name."""
     out = []
     for j in worlds:
         if policy in REFS:
             lpol = reference(policy, j)
         else:
-            lpol = Net(tr, policy, tau, np.random.default_rng([cap.EVAL_SALT, j, 3]))
+            lpol = Net(tr, policy, tau, np.random.default_rng([cap.EVAL_SALT, j, 3]), eps)
         t0 = time.perf_counter()
         r = play(tr, lpol, j)
         out.append(r)

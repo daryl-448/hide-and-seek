@@ -104,6 +104,24 @@ its own block.
 **Cell ``P`` anyway** (the user's decision, outside step 1's rule): one block against NDA-1, read exactly as
 step 2 declares. It is exploratory: step 1 did not select it.
 
+**Outcome of the two blocks** (2026-11-11; runs/repair2/J_nda1_s0/stage1.json, P_nda1_s0/stage1.json). Neither
+is promising. ``J`` keeps its trunk active (about 76 of 128 units fire, no blind state) but its values inflate
+(``Q`` above the return by 3.4) and its world-30 utility is -0.26. ``P`` reaches +0.48 at world 30 (``direct50``:
++0.58, the legacy final: +0.07) and improves from world 20, but its ReLU trunk decays (7 units fire, 4.7 % of
+the panel's states are all-zero, the bar is 1 %) and ``Q`` is 1.09 below the return (tolerance 0.5).
+
+**Cell ``PL``: the wealth scale with a LeakyReLU trunk** (declared 2026-11-11 before its run; the user's
+decision). The legacy learner plus the two changes that each did their part: ``scale = "wealth"`` as in ``P``
+and ``trunk_act = "leaky"`` as in ``J``'s head. Two factors away from the legacy learner, one from ``P``. One block
+against NDA-1 (``run``, 45-minute cap, one attempt), read as step 2 declares, with one difference that follows
+from the trunk, as for ``J``: a leaky trunk cannot be all-zero, so criterion 1 also requires that at world 30 the
+modal row of the network's own output covers at most 5 % of the panel's idle states. Criterion 4 is unchanged,
+although ``P`` failed it: the soft target is compared with the sampled policy's entropy-matched return at
+epsilon 0. To tell a pessimistic critic from the cost of exploration, the reading also plays the world-30
+snapshot on the same four worlds at the training epsilon of 0.05 and reports its utility and ``Q - G`` there
+(reported, not gated; under epsilon the entropy-matched return is not an exact identity). Promising leads to
+``PL`` against Full-0 as its own block.
+
 Usage::
 
     python -m hns.marl.stage1 offline --opp full0        (and nda1)
@@ -136,6 +154,7 @@ VARIANTS = {"shared/raw": ("shared", False), "shared/wealth": ("shared", True),
             "independent/raw": ("independent", False), "independent/wealth": ("independent", True)}
 BETTER, WORSE = 0.8, 1.1                            # a measure at least 20 % lower; at most 10 % higher
 DEV_WORLDS, SNAPS = (100, 101, 102, 103), (20, 30)
+TRAIN_EPS = 0.05                                    # the exploration floor of training, for the reported replay
 A_SLACK, RETAIN, MODAL_MAX = 0.02, 0.05, 0.05
 
 
@@ -275,7 +294,7 @@ def read_run(res: dict, snaps: dict | None, a_final: list[dict], direct50: list[
     ud, rd = r2._col(direct50, "btc_utility"), r2._col(direct50, "reward")
     cell = r2.ALL_CELLS[res["cell"]]
     c1 = res["accounting_gap_max"] <= r2.ACCT_MAX and res["zero_trunk_share"] <= r2.DEAD_MAX
-    if cell.get("critic") == "joint":
+    if cell["trunk_act"] == "leaky":                           # never all-zero: a blind network shows as one row
         c1 = c1 and res["modal_row_share"] <= MODAL_MAX
     c2 = (u[last].mean() >= 0.5 * ud.mean() and rew.mean() >= 0.5 * rd.mean() and u[last].mean() > 0
           and u[last].mean() >= ua.mean() - A_SLACK)
@@ -319,7 +338,7 @@ def cmd_run(a) -> None:
 def read(a) -> dict:
     out = r2.run_dir(a.cell, a.opp, a.seed)
     res = json.loads((out / "result.json").read_text())
-    snaps = argmax = None
+    snaps = argmax = explore = None
     if res["status"] == "ok":
         tr = r2.make(a.cell, a.opp, a.seed, torch.device(a.device))
         try:
@@ -331,18 +350,27 @@ def read(a) -> dict:
                 argmax = r2.evaluate(tr, "argmax", DEV_WORLDS)
         except FloatingPointError as e:                        # a non-finite Q while playing: not promising
             res, snaps = res | {"status": f"aborted: {e}"}, None
+        if snaps is not None:                                  # reported only, so its failure changes no reading
+            try:
+                explore = r2.evaluate(tr, "boltzmann", DEV_WORLDS, eps=TRAIN_EPS)
+            except FloatingPointError:
+                explore = None
     a_final = _dev(json.loads((r2.run_dir("A", a.opp, 0) / "result.json").read_text())["eval"]["boltzmann"])
     reading = read_run(res, snaps, a_final, _dev(r2._refs(a.opp, "selection")["direct50"]), argmax)
     if snaps is not None and argmax is not None:
         reading["argmax_utility"] = float(np.mean([r["btc_utility"] for r in argmax]))
     (out / "stage1.json").write_text(json.dumps({"cell": a.cell, "opp": a.opp, "seed": a.seed, "reading": reading,
                                                   "snaps": None if snaps is None else {str(w): v for w, v in snaps.items()},
-                                                  "argmax": argmax}, indent=1))
+                                                  "argmax": argmax, "explore": explore}, indent=1))
     print(json.dumps(reading, indent=1))
     if snaps is not None:
         shown = {f"world {w}, sampled policy": (rows, "soft") for w, rows in snaps.items()}
         if argmax is not None:                                 # a hard target is calibrated on these, not on the above
             shown[f"world {SNAPS[-1]}, argmax policy"] = (argmax, "hard")
+        if explore is not None:
+            print(f"world {SNAPS[-1]} at the training epsilon {TRAIN_EPS} (reported): BTC utility "
+                  f"{np.mean([r['btc_utility'] for r in explore]):+.3f}")
+            shown[f"world {SNAPS[-1]}, sampled policy at epsilon {TRAIN_EPS}"] = (explore, "soft")
         for name, (rows, k) in shown.items():
             gate = {b: np.sum([r["gate"][b] for r in rows], axis=0).tolist() for b in ("low", "mid", "high")}
             cal = {b: round(float(np.mean([r["cal"][b].get(f"bias_{k}", np.nan) for r in rows])), 3)

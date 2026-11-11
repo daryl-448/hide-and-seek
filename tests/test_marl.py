@@ -1114,6 +1114,7 @@ def test_stage1_cells_offline_fit_and_choice():
     assert r2.STAGE_CELLS["P"] == r2.CELLS["A"] | {"scale": "wealth"} and r2.STAGE_CELLS["I"] == r2.CELLS["A"] | {
         "baseline": "independent"} and not set(r2.STAGE_CELLS) & set(r2.CELLS)
     assert r2.STAGE_CELLS["J"] == r2.CELLS["A"] | {"critic": "joint", "backup": "hard", "trunk_act": "leaky"}
+    assert r2.STAGE_CELLS["PL"] == r2.STAGE_CELLS["P"] | {"trunk_act": "leaky"}
     for c in r2.STAGE_CELLS.values():
         MarlConfig(**c)
     torch.manual_seed(0)
@@ -1203,6 +1204,10 @@ def test_stage1_reading_of_a_run_and_the_gate_table():
     assert not s1.read_run(okj, good, a_final, d50, hard(0.7))["c4"]
     assert not s1.read_run(okj | {"modal_row_share": 0.5}, good, a_final, d50, hard(0.1))["c1"]
     assert s1.read_run(ok | {"modal_row_share": 0.5}, good, a_final, d50)["c1"]              # cell P: as step 2 declares
+    okpl = ok | {"cell": "PL", "modal_row_share": 0.01}                                        # a leaky trunk: the modal row
+    r = s1.read_run(okpl, good, a_final, d50)
+    assert r["promising"] and r["calibration"]["kind"] == "soft"
+    assert not s1.read_run(okpl | {"modal_row_share": 0.06}, good, a_final, d50)["c1"]
     assert [x["world"] for x in s1._dev(rows([1, 2, 3, 4])[::-1] + [{"world": 104}])] == list(s1.DEV_WORLDS)
     d, half = r2.STRATEGIES.index("direct"), r2.AMOUNTS.index(0.5)
     dec = [(0, 1, r2.GO, 0.0, (0.0, 0.1, 0.0, True, 0.5, d, half)), (1, 1, r2.WAIT, 0.0, (0.0, 0.1, 0.0, True, 3.5, 2, half)),
@@ -1406,6 +1411,8 @@ def test_joint_critic_plays_and_is_diagnosed_like_the_others(tmp_path, monkeypat
     assert a1 == a2 and abs(a1["accounting_gap"]) < 1e-9
     b = r2.play(tr, r2.Net(tr, "boltzmann"), 100)
     assert b["cal"]["n"] > 0 and set(b["gate"]) == {"low", "mid", "high"}
+    wild = r2.evaluate(tr, "boltzmann", [100], eps=1.0)[0]      # the exploration rate reaches the policy
+    assert wild != b and abs(wild["accounting_gap"]) < 1e-9 and r2.evaluate(tr, "boltzmann", [100])[0] == b
     m = r2.play(tr, r2.Net(tr, "matched", sched=np.random.default_rng(0)), 100)
     assert math.isclose(m["tranches"], 1.0)
     col = r2._Collect(tr, cap.Scheduled(np.random.default_rng(0), max_launches=3))
