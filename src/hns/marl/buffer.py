@@ -17,6 +17,15 @@ Only finalized entries are sampled.
 
 :class:`VecReplay` is the same thing for the inspector's global branches,
 whose state is a plain vector (the global readout).
+
+**Archive** (repair cycle 2, ``replay = "archive"``): next to the ring, a
+:class:`Archive` keeps a lifetime-uniform reservoir of finalized transitions
+(Algorithm R: the k-th finalized transition is kept with probability
+``capacity / k``). An archived transition owns its next observation, because
+the ring's ``nxt`` ids only hold while the next entry is still in the ring. A
+batch then draws ``ARCHIVE_SAMPLE`` of its rows from the archive and the rest
+from the ring. The reservoir draws from its own seeded generator, which is
+saved with the buffer.
 """
 
 from __future__ import annotations
@@ -24,11 +33,47 @@ from __future__ import annotations
 import numpy as np
 
 PENDING, TERMINAL = -2, -1
+ARCHIVE_SHARE, ARCHIVE_SAMPLE = 0.2, 0.25     # of the buffer's capacity; of a batch's rows
+_KEYS = ("masks", "active", "action", "realized", "reward", "done", "next_masks", "next_active", "t")
+
+
+class Archive:
+    """A lifetime-uniform reservoir of finalized transitions, each stored whole."""
+
+    def __init__(self, capacity: int, sizes: list[int], seed):
+        self.cap, self.n, self.seen = capacity, 0, 0
+        self.rng = np.random.default_rng(seed)
+        nb, w = len(sizes), sum(sizes)
+        self.obs, self.next_obs = [None] * capacity, [None] * capacity
+        self.masks, self.next_masks = np.ones((capacity, w), bool), np.ones((capacity, w), bool)
+        self.active, self.next_active = np.zeros((capacity, nb), bool), np.zeros((capacity, nb), bool)
+        self.action, self.realized = np.zeros((capacity, nb), np.int64), np.zeros((capacity, nb), bool)
+        self.reward, self.done = np.zeros(capacity, np.float32), np.zeros(capacity, bool)
+        self.t, self.gap = np.zeros(capacity, np.int64), np.zeros(capacity, np.int64)
+
+    def offer(self, tr: dict) -> None:
+        self.seen += 1
+        s = self.n if self.n < self.cap else int(self.rng.integers(0, self.seen))
+        if s >= self.cap:
+            return
+        self.n = max(self.n, s + 1)
+        self.obs[s], self.next_obs[s], self.gap[s] = tr["obs"], tr["next_obs"], tr["gap"]
+        for k in _KEYS:
+            getattr(self, k)[s] = tr[k]
+
+    def sample(self, k: int, rng: np.random.Generator) -> dict:
+        s = rng.integers(0, self.n, k)
+        live = ~self.done[s]
+        out = {key: getattr(self, key)[s] for key in _KEYS}
+        return out | {"obs": [self.obs[i] for i in s], "next_obs": [self.next_obs[i] for i in s[live]],
+                      "next_masks": self.next_masks[s[live]], "next_active": self.next_active[s[live]],
+                      "gap": self.gap[s[live]]}
 
 
 class Replay:
-    def __init__(self, capacity: int, sizes: list[int]):
+    def __init__(self, capacity: int, sizes: list[int], archive: int = 0, seed=0):
         self.cap, self.sizes, self.n = capacity, list(sizes), 0
+        self.arch = Archive(archive, sizes, seed) if archive else None
         nb = len(sizes)
         self.obs: list = [None] * capacity
         self.masks = np.ones((capacity, sum(sizes)), bool)
@@ -64,14 +109,27 @@ class Replay:
         if self.alive(i):
             self.reward[i % self.cap] += r
 
+    def _archive(self, s: int, n: int | None) -> None:
+        """Offer the transition of slot ``s``, finalized just now, to the archive; ``n``: its next state's slot."""
+        tr = {k: getattr(self, k)[s].copy() for k in ("masks", "active", "action", "realized", "reward", "t")}
+        tr |= {"obs": self.obs[s], "done": n is None, "next_obs": None if n is None else self.obs[n],
+               "next_masks": True if n is None else self.masks[n].copy(),
+               "next_active": False if n is None else self.active[n].copy(),
+               "gap": 0 if n is None else self.t[n] - self.t[s]}
+        self.arch.offer(tr)
+
     def link(self, i: int, j: int) -> None:
         """Entry ``j`` holds the next state of entry ``i``."""
         if self.alive(i):
             self.nxt[i % self.cap] = j
+            if self.arch is not None:
+                self._archive(i % self.cap, j % self.cap)
 
     def end(self, i: int) -> None:
         if self.alive(i):
             self.nxt[i % self.cap] = TERMINAL
+            if self.arch is not None:
+                self._archive(i % self.cap, None)
 
     @property
     def ready(self) -> int:
@@ -79,16 +137,39 @@ class Replay:
         return int(np.count_nonzero(self.nxt[:min(self.n, self.cap)] != PENDING))
 
     def sample(self, k: int, rng: np.random.Generator) -> dict:
-        """``k`` finalized transitions, uniformly with replacement."""
+        """``k`` finalized transitions, uniformly with replacement; with an archive, ``ARCHIVE_SAMPLE`` of them come
+        from it (the last rows; ``n_archive`` says how many)."""
+        ka = int(round(ARCHIVE_SAMPLE * k)) if self.arch is not None and self.arch.n else 0
         slots = np.flatnonzero(self.nxt[:min(self.n, self.cap)] != PENDING)
-        s = slots[rng.integers(0, len(slots), k)]
+        s = slots[rng.integers(0, len(slots), k - ka)]
         nxt = self.nxt[s]
         live = nxt >= 0
         ns = nxt[live] % self.cap
-        return {"obs": [self.obs[i] for i in s], "masks": self.masks[s], "active": self.active[s],
-                "action": self.action[s], "realized": self.realized[s], "reward": self.reward[s],
-                "done": ~live, "next_obs": [self.obs[i] for i in ns], "next_masks": self.masks[ns],
-                "next_active": self.active[ns], "gap": self.t[ns] - self.t[s[live]]}
+        out = {"obs": [self.obs[i] for i in s], "masks": self.masks[s], "active": self.active[s],
+               "action": self.action[s], "realized": self.realized[s], "reward": self.reward[s], "t": self.t[s],
+               "done": ~live, "next_obs": [self.obs[i] for i in ns], "next_masks": self.masks[ns],
+               "next_active": self.active[ns], "gap": self.t[ns] - self.t[s[live]], "n_archive": ka}
+        if ka:
+            a = self.arch.sample(ka, rng)
+            out = {key: v if key == "n_archive" else (v + a[key] if isinstance(v, list) else np.concatenate([v, a[key]]))
+                   for key, v in out.items()}
+        return out
+
+    def support(self) -> dict:
+        """What the buffer holds (repair cycle 2's replay log): entries ever added, finalized entries, the sub-steps
+        they were observed at (quantiles 0 / 10 / 50 / 90 / 100 %), and how often each option of each branch was
+        taken and realized; the same for the archive."""
+        def part(t, action, realized, n):
+            counts = [np.bincount(action[realized[:, b], b], minlength=m).tolist() for b, m in enumerate(self.sizes)]
+            return {"stored": int(n), "t": np.quantile(t, [0, 0.1, 0.5, 0.9, 1]).tolist() if n else [], "options": counts}
+
+        k = min(self.n, self.cap)
+        fin = self.nxt[:k] != PENDING
+        out = {"added": self.n, **part(self.t[:k][fin], self.action[:k][fin], self.realized[:k][fin], fin.sum())}
+        if self.arch is not None:
+            a = self.arch
+            out["archive"] = {"seen": a.seen, **part(a.t[:a.n], a.action[:a.n], a.realized[:a.n], a.n)}
+        return out
 
 
 class VecReplay:

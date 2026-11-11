@@ -10,13 +10,13 @@ import torch
 
 import hns.marl.train as mt
 from hns.data.norm import Normalizer
-from hns.marl.buffer import PENDING, TERMINAL, Replay, VecReplay
+from hns.marl.buffer import ARCHIVE_SAMPLE, PENDING, TERMINAL, Replay, VecReplay
 from hns.marl.learner import MarlConfig, RealViews
 from hns.marl.obs import (BRANCHES, D_CAND, I_CTRL, L_CTRL, Featurizer, ObsBatch, collate, detector_obs, identity_stats,
                           innocent_obs, launderer_obs, pack_masks, world_readout)
 from hns.models.detector import Detector, Graph, kl_normal, target_rows
 from hns.models.hrg import Views
-from hns.models.qnet import AgentQ, BranchHeads, root_value, sample_actions, soft_value, td_loss
+from hns.models.qnet import AgentQ, BranchHeads, root_max, root_value, sample_actions, soft_value, td_loss
 from hns.sim.entities import K_RECIPIENTS
 from hns.sim.env import SimEnv
 from hns.sim.live import KIND_CTRL, KIND_TX, KIND_W, LiveGraph
@@ -334,14 +334,15 @@ def test_nda_run_transitions_health_and_resume(tmp_path, monkeypatch):
                torch.load(out / "ckpt" / "final.pt", weights_only=False)["models"]["det_t"].items())
 
 
-def test_resume_replays_the_killed_world_exactly(tmp_path, monkeypatch):
-    a = _trainer(tmp_path, monkeypatch, "nda")
+@pytest.mark.parametrize("kw", [{}, {"replay": "archive", "baseline": "independent", "backup": "hard"}])
+def test_resume_replays_the_killed_world_exactly(tmp_path, monkeypatch, kw):
+    a = _trainer(tmp_path, monkeypatch, "nda", **kw)
     a.run()
     out = tmp_path / "nda"
     whole = [json.loads(x) for x in (out / "metrics.jsonl").read_text().splitlines()]
     # a second run, killed after world 1: keep its world-1 checkpoint, then resume
     out2 = tmp_path / "again"
-    b = _trainer(tmp_path, monkeypatch, "nda")
+    b = _trainer(tmp_path, monkeypatch, "nda", **kw)
     b.out = out2
     (out2 / "ckpt").mkdir(parents=True)
     (out2 / "metrics.jsonl").write_text("")
@@ -350,7 +351,7 @@ def test_resume_replays_the_killed_world_exactly(tmp_path, monkeypatch):
     with open(out2 / "metrics.jsonl", "a") as f:               # records of the killed world, the last one cut short
         f.write(json.dumps({"kind": "episode", "episode": 2, "world": 1}) + "\n")
         f.write('{"kind": "episode", "episode": 3, "wor')
-    c = _trainer(tmp_path, monkeypatch, "nda")
+    c = _trainer(tmp_path, monkeypatch, "nda", **kw)
     c.out = out2
     c.run()
     again = [json.loads(x) for x in (out2 / "metrics.jsonl").read_text().splitlines()]
@@ -494,7 +495,7 @@ def test_role_targets_bootstrap_their_branches_at_gamma_per_sub_step(tmp_path, m
     tr.run()
     seen = {}
 
-    def fake_td(q, sizes, action, realized, y):
+    def fake_td(q, sizes, action, realized, y, kind="mse"):
         seen["y"] = y.detach().clone()
         return (torch.where(torch.isfinite(q), q, torch.zeros_like(q)) * 0.0).sum()
 
@@ -697,6 +698,337 @@ def test_capability_calibration_discounts_per_sub_step_to_world_end():
     g = np.array([-0.001 + 0.9 ** 10 * 1.0, 1.0])
     assert c["q_n"] == 2 and math.isclose(c["q_bias"], float(np.mean(np.array([1.0, 2.0]) - g)), rel_tol=1e-12)
     assert math.isclose(c["g_abs_mean"], float(np.abs(g).mean()), rel_tol=1e-12) and c["q_max"] == 2.0
+
+
+# ---------------------------------------------------------------------------- repair cycle 2: learner variants
+def test_head_variants_start_from_the_same_weights_and_free_the_branch_means():
+    def heads(**kw):
+        torch.manual_seed(3)
+        return BranchHeads(6, {"root": 2, "a": 3, "ptr": 4}, pointer={"ptr": 5}, **kw)
+
+    x, cand, masks = torch.randn(5, 6), torch.randn(5, 4, 5), torch.ones(5, 9, dtype=torch.bool)
+    base, ind = heads(), heads(baseline="independent")
+    assert all(torch.equal(v, ind.state_dict()[k]) for k, v in base.state_dict().items())
+    q0 = base(x, masks, {"ptr": cand})
+    assert torch.equal(ind(x, masks, {"ptr": cand}), q0)       # a branch's own V starts as a copy of the shared one
+    with torch.no_grad():
+        ind.value_b["a"].bias += 2.0
+    q = ind(x, masks, {"ptr": cand})
+    assert torch.allclose(q[:, 2:5].mean(1), q0[:, 2:5].mean(1) + 2.0, atol=1e-5)       # its mean moves alone
+    assert torch.equal(q[:, :2], q0[:, :2]) and torch.equal(q[:, 5:], q0[:, 5:])
+    for kw in ({"act": "leaky"}, {"norm": True}):
+        v = heads(**kw)
+        assert all(torch.equal(t, v.state_dict()[k]) for k, t in base.state_dict().items())
+    leaky = heads(act="leaky")
+    pre = leaky.trunk[0](x)
+    assert (pre < 0).any() and torch.allclose(leaky.trunk(x), torch.where(pre > 0, pre, 0.01 * pre))
+    with pytest.raises(ValueError):
+        heads(baseline="joint")
+
+
+def test_root_max_and_the_loss_variants_by_hand():
+    sizes = [2, 3]
+    q = torch.tensor([[1.0, 2.0, 50.0, 0.0, 9.0], [0.5, NEG, 7.0, 7.0, 7.0]])
+    assert torch.equal(root_max(q, sizes), torch.tensor([2.0, 0.5]))
+    q = torch.tensor([[1.0, 2.0, 0.5, NEG, 1.5], [0.0, 4.0, 3.0, 1.0, NEG], [0.0, 0.0, 0.0, 0.0, 0.0]])
+    action = torch.tensor([[1, 2], [0, 2], [0, 1]])
+    realized = torch.tensor([[True, True], [True, False], [True, True]])
+    y = torch.tensor([1.0, 3.0, 0.5])
+    d = [(1 - 2.0, 1 - 1.5), (3 - 0.0, None), (0.5, 0.5)]
+    hub = lambda e: e * e if abs(e) <= 1 else 2 * abs(e) - 1       # noqa: E731
+    want = np.mean([(hub(-1.0) + hub(-0.5)) / 2, hub(3.0), (hub(0.5) + hub(0.5)) / 2])
+    assert math.isclose(td_loss(q, sizes, action, realized, y, "huber").item(), want, rel_tol=1e-6)
+    assert hub(3.0) == 5.0 < 9.0                                # only the tail differs from the squared error
+    want = np.mean([1.0, 9.0, 0.25]) + 0.25 * np.mean([0.25, 0.25])
+    assert math.isclose(td_loss(q, sizes, action, realized, y, "branch").item(), want, rel_tol=1e-6)
+    none = torch.tensor([[True, False]] * 3)                    # a branch no row realizes adds nothing
+    assert math.isclose(td_loss(q, sizes, action, none, y, "branch").item(), np.mean([1.0, 9.0, 0.25]), rel_tol=1e-6)
+    with pytest.raises(ValueError):
+        td_loss(q, sizes, action, realized, y, "l1")
+
+
+def test_archive_keeps_whole_transitions_past_the_ring_and_samples_its_share():
+    rng = np.random.default_rng(0)
+    buf = Replay(4, [2, 3], archive=50, seed=1)
+    m, act = np.ones(5, bool), np.array([True, True])
+    prev = None
+    for k in range(40):                                        # one chain of 40 states; the ring holds 4
+        i = buf.add(f"s{k}", m, act, t=3 * k)
+        if prev is not None:
+            buf.link(prev, i)
+        buf.set(i, [k % 2, k % 3], [True, k % 2 == 0], float(k))
+        prev = i
+    buf.end(prev)
+    a = buf.arch
+    assert a.n == a.seen == 40 and buf.ready == 4
+    s = a.sample(400, rng)
+    k = np.array([int(o[1:]) for o in s["obs"]])
+    assert set(k) > set(range(30)) and (s["reward"] == k).all() and (s["done"] == (k == 39)).all()
+    assert s["next_obs"] == [f"s{j + 1}" for j in k[~s["done"]]] and (s["gap"] == 3).all() and (s["t"] == 3 * k).all()
+    assert (s["action"][:, 0] == k % 2).all() and (s["realized"][:, 1] == (k % 2 == 0)).all()
+    s = buf.sample(64, rng)
+    ka = int(round(ARCHIVE_SAMPLE * 64))
+    assert s["n_archive"] == ka and len(s["obs"]) == 64 == len(s["done"]) and len(s["next_obs"]) == (~s["done"]).sum()
+    recent = np.array([int(o[1:]) for o in s["obs"][:64 - ka]])
+    assert recent.min() >= 36 and len(s["gap"]) == len(s["next_obs"]) and s["next_masks"].shape == (len(s["gap"]), 5)
+    sup = buf.support()
+    assert sup["added"] == 40 and sup["stored"] == 4 and sup["archive"]["seen"] == 40 and sup["archive"]["stored"] == 40
+    assert sup["archive"]["options"][0] == [20, 20] and sum(sup["archive"]["options"][1]) == 20
+    assert Replay(4, [2]).arch is None
+
+
+def test_archive_is_a_lifetime_uniform_reservoir():
+    buf = Replay(8, [2], archive=200, seed=5)
+    ones = np.ones(2, bool), np.ones(1, bool)
+    for k in range(4000):
+        buf.end(buf.add(k, *ones, t=k))
+    a = buf.arch
+    assert a.n == 200 and a.seen == 4000 and len(set(a.obs)) == 200
+    t = a.t[:200]
+    assert abs(t.mean() - 2000) < 4 * 4000 / math.sqrt(12 * 200) and (t < 1000).sum() > 25 < (t >= 3000).sum()
+
+
+def test_learner_variants_train_only_the_design_roles(tmp_path, monkeypatch):
+    kw = dict(baseline="independent", backup="hard", trunk_act="leaky", head_norm=True, replay="archive", td="branch",
+              design_roles="launderer")
+    tr = _trainer(tmp_path, monkeypatch, "nda", episodes=4, **kw)
+    L, inn = tr.roles["launderer"], tr.roles["innocent"]
+    assert L.net.heads.value_b is not None and L.net.heads.norm is not None and L.buf.arch is not None
+    assert inn.net.heads.value_b is None and inn.net.heads.norm is None and inn.buf.arch is None
+    assert inn.design == MarlConfig().design("innocent") and L.buf.cap + L.buf.arch.cap == tr.cfg.buffer
+    tr.run()
+    e = tr.epochs[-1]
+    st = e["learner"]["launderer"]
+    assert st["n"] > 0 and st["archive_share"] == 0.25 and 0 <= st["clip_share"] <= 1 and st["grad_norm"] > 0
+    assert st["branch_rows"]["initiate"] == tr.cfg.batch and sum(st["sampled_options"]["initiate"]) == st["n"] * tr.cfg.batch
+    assert e["learner"]["innocent"]["archive_share"] == 0 and e["replay"]["launderer"]["archive"]["seen"] > 0
+    dec = e["launderer"]["decisions"]
+    launches = np.array(e["launderer"]["launches"])
+    assert launches.shape == (9, 4, 2) and launches.sum() == dec.get("idle_go", 0)
+    assert math.isfinite(e["reward"]["launderer_discounted"]) and st["grad_norm_head"] <= st["grad_norm"] + 1e-9
+    assert st["loss_coef"]["initiate"] == 1.0 and all(0 < v <= 0.25 for k, v in st["loss_coef"].items() if k != "initiate")
+    assert math.isclose(sum(e["learner"]["innocent"]["loss_coef"].values()), 1.0, rel_tol=1e-9)   # mse: weights sum to 1
+    # the hard backup: the target is the root's max, whatever tau is
+    b = L.buf.sample(16, np.random.default_rng(0))
+    with torch.no_grad():
+        q2 = L._q(L.targ, collate(b["next_obs"]), b["next_masks"])
+    y = torch.from_numpy(b["reward"]).clone()
+    y[torch.from_numpy(~b["done"])] += torch.from_numpy(tr.cfg.gamma ** b["gap"].astype(np.float64)).float() * root_max(q2, L.sizes)
+    assert torch.allclose(L.batch_target(b), y, atol=1e-5)
+    with pytest.raises(ValueError):
+        MarlConfig(backup="hard", target="mean")
+    with pytest.raises(ValueError):
+        MarlConfig(replay="per")
+
+
+def test_a_non_finite_loss_stops_the_update(tmp_path, monkeypatch):
+    tr = _trainer(tmp_path, monkeypatch, "nda", episodes=2)
+    tr.run()
+    L = tr.roles["launderer"]
+    with torch.no_grad():
+        L.net.heads.value.bias.fill_(float("nan"))
+    with pytest.raises(FloatingPointError):
+        L.update(np.random.default_rng(0))
+    b = L.buf.sample(4, np.random.default_rng(0))
+    with pytest.raises(FloatingPointError):                    # acting on a non-finite feasible Q stops too
+        L.q_values(collate(b["obs"]), b["masks"])
+
+
+
+# ---------------------------------------------------------------------------- repair cycle 2: harness
+def test_repair2_cells_cover_the_declared_design():
+    from hns.marl import repair2 as r2
+
+    assert len(r2.CELLS) == 12 and set(r2.RUN_ORDER) == set(r2.SIMPLEST_FIRST) == set(r2.CELLS)
+    fact = {(c["baseline"], c["backup"], c["replay"]) for k, c in r2.CELLS.items() if len(k) == 3}
+    assert len(fact) == 8 and all(r2.CELLS[k]["trunk_act"] == "leaky" for k in r2.CELLS if k != "A")
+    base = r2.CELLS["IHF"]
+    assert r2.CELLS["A"] == r2.CELLS["SSF"] | {"trunk_act": "relu"}
+    assert [k for k in r2.CELLS if r2.CELLS[k] == base] == ["IHF"]
+    for k, diff in (("W", {"td": "branch"}), ("H", {"td": "huber"}), ("LN", {"head_norm": True})):
+        assert r2.CELLS[k] == base | diff
+    for c in r2.CELLS.values():
+        MarlConfig(**c)                                         # every cell is a valid learner variant
+
+
+def test_repair2_calibration_matches_the_hard_and_the_soft_return():
+    from hns.marl.repair2 import calibrate
+
+    g, tau = 0.9, 0.5
+    # (step, agent, a0, reward, (Q_wait, Q_go, root entropy, idle, log balance))
+    dec = [(0, 7, 0, -0.001, (1.0, 9.0, 0.3, True, 0.0)), (10, 7, 1, 1.0, (9.0, 2.0, 0.6, False, 3.5)),
+           (3, 8, 0, 0.5, None)]
+    c = calibrate(dec, g, tau, mid=5)
+    hard = np.array([-0.001 + g ** 10 * 1.0, 1.0])
+    soft = np.array([-0.001 + g ** 10 * (1.0 + tau * 0.6), 1.0])   # the next decision's entropy, never the current one
+    q = np.array([1.0, 2.0])
+    assert c["n"] == 2 and math.isclose(c["bias_hard"], (q - hard).mean(), rel_tol=1e-12)
+    assert math.isclose(c["bias_soft"], (q - soft).mean(), rel_tol=1e-12)
+    assert math.isclose(c["g_abs_soft"], np.abs(soft).mean(), rel_tol=1e-12) and c["q_max"] == 2.0
+    assert c["idle"]["n"] == 1 == c["flight"]["n"] and math.isclose(c["flight"]["bias_hard"], 1.0, rel_tol=1e-12)
+    assert [c[k]["n"] for k in ("bal_low", "bal_mid", "bal_high", "early", "late")] == [1, 0, 1, 1, 1]
+    assert math.isclose(c["late"]["bias_soft"], 1.0, rel_tol=1e-12) and c["bal_mid"] == {"n": 0}
+    assert calibrate([(0, 1, 0, 0.0, None)], g, tau) == {"n": 0}
+
+
+def _world_rows(utility, reward=None):
+    return [{"btc_utility": u, "reward": u if reward is None else r} for u, r in zip(utility, reward or utility)]
+
+
+def test_repair2_gates_and_the_selection_rule():
+    from hns.marl import repair2 as r2
+
+    n = 8
+    refs = {"wait": _world_rows([0.0] * n, [-0.05] * n), "direct50": _world_rows([0.6] * n),
+            "repeat50": _world_rows([0.7] * n), "uniform": _world_rows([-0.9] * n)}
+    jit = np.linspace(-0.02, 0.02, n)
+    f = r2.floors({"reward": 0.4 + jit, "btc_utility": 0.4 + jit}, -0.5 + jit, refs)
+    assert f["p2"] and f["p3"] and math.isclose(f["matched"]["vs_uniform"][0], 0.4, abs_tol=1e-9)
+    assert not r2.floors({"reward": 0.25 + jit, "btc_utility": 0.4 + jit}, -0.5 + jit, refs)["p2"]   # under half of direct50
+    assert not r2.floors({"reward": 0.4 + jit, "btc_utility": 0.4 + jit}, -0.89 + jit, refs)["p3"]   # under +0.02
+    wide = np.array([3.0, -2.5] * 4)
+    assert not r2.floors({"reward": 0.4 + wide, "btc_utility": 0.4 + wide}, -0.5 + jit, refs)["p2"]   # CI includes 0
+
+    def ev(bias, g_abs=0.4):
+        cal = {"n": 10, "bias_soft": bias, "bias_hard": bias, "g_abs_soft": g_abs, "g_abs_hard": g_abs, "q_max": 1.0}
+        rows = [{"btc_utility": 0.4 + j, "reward": 0.4 + j, "cal": cal, "q_cap": 5.0} for j in jit]
+        return {"boltzmann": rows, "argmax": rows, "matched": _world_rows(-0.5 + jit),
+                "snap0": _world_rows([0.0, 0.0]), "snap16": _world_rows([0.3, 0.3]), "snap24": _world_rows([0.3, 0.3])}
+
+    def res(cell, opp, **kw):
+        return {"cell": cell, "opp": opp, "status": "ok", "accounting_gap_max": 0.0, "zero_trunk_share": 0.0,
+                "eval": ev(0.1)} | kw
+
+    ok = r2.screen_row(res("IHF", "full0"), refs)
+    assert ok["pass"] and ok["p1"] and ok["calibration"]["kind"] == "hard" and r2.screen_row(res("SSF", "full0"), refs)[
+        "calibration"]["kind"] == "soft"
+    assert not r2.screen_row(res("IHF", "full0", eval=ev(0.6)), refs)["p1"]                 # bias over max(0.5, 0.25 |G|)
+    assert r2.screen_row(res("IHF", "full0", eval=ev(0.6, g_abs=4.0)), refs)["p1"]
+    assert not r2.screen_row(res("A", "full0", zero_trunk_share=0.5), refs)["pass"]
+    assert not r2.screen_row(res("IHF", "full0", accounting_gap_max=1e-3), refs)["pass"]
+    bad = r2.screen_row({"cell": "H", "opp": "full0", "status": "aborted: x"}, refs)
+    assert not bad["pass"] and not bad["p1"]
+
+    def rows(score):
+        out = {}
+        for cell, u in score.items():
+            for opp in r2.OPPS:
+                r = r2.screen_row(res(cell, opp), refs)
+                r["btc_utility"]["mean"] = u if opp == "full0" else u + 0.1      # the worst opponent counts
+                out[(cell, opp)] = r
+        return out
+
+    assert r2.choose(rows({"LN": 0.50, "IHF": 0.485, "A": 0.47}))["cell"] == "IHF"       # tied within 0.02: simplest
+    assert r2.choose(rows({"LN": 0.50, "IHF": 0.47, "ISR": 0.49}))["cell"] == "ISR"
+    sel = r2.choose(rows({"LN": 0.50, "IHF": 0.47}))
+    assert sel["cell"] == "LN" and sel["reference_world"] == 24 and sel["passing"] == ["IHF", "LN"]
+    r = rows({"LN": 0.5})
+    r[("LN", "nda1")]["pass"] = False
+    assert r2.choose(r) == {"cell": None, "passing": []}
+    del r[("LN", "nda1")]
+    assert r2.choose(r)["cell"] is None
+
+
+def test_repair2_an_aborted_confirmation_seed_fails_the_cycle(tmp_path, monkeypatch):
+    from hns.marl import repair2 as r2
+
+    monkeypatch.setattr(r2, "RUNS", tmp_path)
+    rows = _world_rows([0.0] * 8)
+    for opp in r2.OPPS:
+        for pol in r2.REFS:
+            r2.ref_path(opp, "confirmation", pol).write_text(json.dumps({"eval": rows}))
+        for seed in (0, 1, 2):
+            d = r2.run_dir("IHF", opp, seed)
+            d.mkdir()
+            status = "aborted: non-finite Q" if (opp, seed) == ("nda1", 2) else "ok"
+            (d / "result.json").write_text(json.dumps({"cell": "IHF", "opp": opp, "seed": seed, "status": status,
+                                                       "accounting_gap_max": 0.0, "zero_trunk_share": 0.0}))
+    (tmp_path / "selection.json").write_text(json.dumps({"cell": "IHF", "reference_world": 24}))
+
+    class A:
+        opp, seed, eval_worlds, device = "nda1", 2, None, "cpu"
+
+    r2.cmd_confirm_eval(A)                                      # no snapshot is loaded for an aborted run
+    assert json.loads((r2.run_dir("IHF", "nda1", 2) / "confirm.json").read_text())["status"].startswith("aborted")
+    cal = {"n": 5, "bias_hard": 0.0, "g_abs_hard": 1.0, "q_max": 1.0}
+    ev = {k: [{"btc_utility": 0.5, "reward": 0.5, "cal": cal, "q_cap": 5.0}] * 8 for k in ("boltzmann", "argmax", "matched", "reference")}
+    for opp in r2.OPPS:
+        for seed in (0, 1, 2):
+            if (opp, seed) != ("nda1", 2):
+                (r2.run_dir("IHF", opp, seed) / "confirm.json").write_text(json.dumps({"status": "ok", "eval": ev}))
+    con = r2.confirmation({"cell": "IHF", "reference_world": 24})
+    assert not con["pass"] and con["opps"]["nda1"] == {"aborted": ["seed 2: aborted: non-finite Q"], "pass": False}
+    assert "p2" in con["opps"]["full0"]
+
+
+def test_repair2_references_share_one_launch_schedule_and_repeat50_relaunches(monkeypatch):
+    from hns.marl import capability as cap, repair2 as r2
+    from hns.sim.entities import AMOUNTS, STRATEGIES
+
+    monkeypatch.setattr(cap, "LAUNCH_LAST", 5)
+    first, total = {}, {}
+    for name in ("uniform", "direct50", "repeat50"):
+        pol = r2.reference(name, 7)
+        env = SimEnv(TINY, 2, launderers=pol)
+        env.start_episode(0)
+        for _ in range(30):
+            env.step()
+        first[name], total[name] = dict(pol.when), int(env.acct["strategy"].sum())
+    assert first["uniform"] == first["direct50"] == first["repeat50"]
+    assert total["direct50"] == TINY.n_launderers < total["repeat50"] <= 6 * TINY.n_launderers
+    assert r2.reference("wait", 7).never and r2.reference("repeat50", 7).amount == AMOUNTS.index(0.5)
+    assert r2.reference("repeat50", 7).strategy == STRATEGIES.index("direct")
+
+
+def test_repair2_policies_panel_and_safety_check(tmp_path, monkeypatch):
+    from hns.marl import capability as cap, repair2 as r2
+
+    tr = _trainer(tmp_path, monkeypatch, "nda", episodes=2, learn=("launderer",),
+                  fixed_eps={"innocent": 0.05, "detector": 0.05}, design_roles="launderer", **r2.CELLS["IHR"])
+    monkeypatch.setattr(r2, "EPISODES", 2)
+    monkeypatch.setattr(r2, "SUBSTEPS", 12)
+    monkeypatch.setattr(r2, "draw_world", lambda c, rng: c)
+    monkeypatch.setattr(cap, "LAUNCH_LAST", 3)
+    tr.run_world()
+    n_le = TINY.n_launderers * 2
+    m = r2.play(tr, r2.Net(tr, "matched", sched=np.random.default_rng(0)), 100)
+    assert math.isclose(m["tranches"], 1.0) and m["decisions"]["idle_go"] == n_le       # one launch each, per episode
+    assert m["decisions"].get("flight_wait", 0) == 0 and abs(m["accounting_gap"]) < 1e-9
+    a1, a2 = (r2.play(tr, r2.Net(tr, "argmax"), 100) for _ in range(2))
+    assert a1 == a2 and a1["cal"]["bias_soft"] == a1["cal"]["bias_hard"]                # argmax: no entropy, no sampling
+    b = r2.play(tr, r2.Net(tr, "boltzmann"), 100)
+    assert b["cal"]["n"] > 0 and math.isfinite(b["cal"]["bias_soft"]) and b["cal"]["bias_soft"] <= b["cal"]["bias_hard"]
+    assert np.sum(b["launches"]) == b["decisions"].get("idle_go", 0)
+    # a panel from collected states, its statistics, and the abort rule
+    col = r2._Collect(tr, cap.Scheduled(np.random.default_rng(0), max_launches=3))
+    r2.play(tr, col, 300)
+    idle = np.array([o[4][0] == 0 for o, _ in col.rows])
+    assert idle.any() and (~idle).any()
+    panel = {"obs": [o for o, _ in col.rows], "masks": np.stack([k for _, k in col.rows]), "idle": idle,
+             "bal": np.array([o[4][1] for o, _ in col.rows], np.float32)}
+    diag = r2.Diagnostics(tr, panel)
+    st = diag.panel_stats()
+    assert st["zero_trunk_share"] == 0.0 and 0 < st["units_active"] <= 128 and 0 <= st["no_unit_share"] <= 1
+    assert math.isfinite(st["direct_margin_tau"]) and 0 < st["modal_row_share"] <= 1 and st["q_abs_max"] > 0
+    assert set(st["q_table"]) == set(st["q_table_target"]) == set(BRANCHES["launderer"]) and len(st["q_table"]["strategy"]["mean"]) == 9
+    g = diag.grad_stats()
+    assert g is None or (len(g["residual_abs"]["initiate"]) == 3 and (g["launch_rows"] == 0 or -1 <= g["cosine"] <= 1))
+    L = tr.roles["launderer"]
+    monkeypatch.setattr(r2, "Q_ABORT", 0.0)
+    L.n_updates = r2.CHECK_EVERY
+    diag.check(tr)                                              # the first check over the bound: not yet
+    diag.check(tr)                                              # the same update again: not a new check
+    L.n_updates = 2 * r2.CHECK_EVERY
+    with pytest.raises(r2.Abort):
+        diag.check(tr)
+    snap = tmp_path / "w.pt"
+    r2.snapshot(tr, snap)
+    before = {k: v.clone() for k, v in L.net.state_dict().items()}
+    with torch.no_grad():
+        L.net.heads.value.bias += 1.0
+    r2.load_snapshot(tr, snap)
+    assert all(torch.equal(v, L.net.state_dict()[k]) for k, v in before.items())
+
 
 
 def test_kind_values_agree():

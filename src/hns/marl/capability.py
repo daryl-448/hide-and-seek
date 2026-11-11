@@ -149,16 +149,21 @@ class Learned:
 class Scheduled:
     """One launch per launderer and episode, at its first idle decision on or after a uniform sub-step in
     [0, ``LAUNCH_LAST``]; in flight it always proceeds. ``strategy`` / ``amount``: a fixed option index, or
-    ``None`` for uniform over the feasible ones. ``never``: always wait."""
+    ``None`` for uniform over the feasible ones. ``never``: always wait. ``max_launches``: up to that many
+    launches per episode, the later ones at the next idle decisions that allow one (repair cycle 2's repeated
+    reference). ``sched_rng``: a generator for the launch sub-steps alone, so that policies given equal ones launch
+    at the same sub-steps (default: ``rng``, as in the first capability test)."""
 
-    def __init__(self, rng: np.random.Generator, strategy=None, amount=None, never: bool = False):
+    def __init__(self, rng: np.random.Generator, strategy=None, amount=None, never: bool = False, max_launches: int = 1,
+                 sched_rng: np.random.Generator | None = None):
         self.rng, self.strategy, self.amount, self.never = rng, strategy, amount, never
-        self.when, self.launched, self.ep = {}, set(), None
+        self.max, self.sched = max_launches, sched_rng if sched_rng is not None else rng
+        self.when, self.launched, self.ep = {}, defaultdict(int), None
 
     def act(self, env, states: dict) -> dict:
         if env.episode != self.ep:
-            self.ep, self.launched = env.episode, set()
-            self.when = {L.id: int(self.rng.integers(0, LAUNCH_LAST + 1)) for L in env.launderers}
+            self.ep, self.launched = env.episode, defaultdict(int)
+            self.when = {L.id: int(self.sched.integers(0, LAUNCH_LAST + 1)) for L in env.launderers}
         out = {}
         for i, st in states.items():
             if len(st.branches) == 1:
@@ -166,14 +171,15 @@ class Scheduled:
                 continue
             a = {b: int(self.rng.choice(np.flatnonzero(st.masks[b]))) for b in st.branches}
             a["initiate"] = WAIT
-            due = not self.never and i not in self.launched and env.sub >= self.when[i] and st.masks["initiate"][GO]
+            due = (not self.never and self.launched[i] < self.max and env.sub >= self.when[i]
+                   and st.masks["initiate"][GO])
             if due and (self.amount is None or st.masks["amount"][self.amount]):
                 if self.strategy is not None:
                     a["strategy"] = self.strategy
                 if self.amount is not None:
                     a["amount"] = self.amount
                 a["initiate"] = GO
-                self.launched.add(i)
+                self.launched[i] += 1
             out[i] = a
         return out
 

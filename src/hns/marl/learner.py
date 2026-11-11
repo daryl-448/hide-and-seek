@@ -25,7 +25,21 @@ target bootstraps through all of ``B(s')``, so branches trained only on
 launches carry most of every idle state's target (reports/m5_marl.md).
 
 The role networks have their own dropout, ``q_dropout``: acting and the
-target network run in eval mode, updates in train mode.
+target network run in eval mode, updates in train mode. It is 0: at 0.5 the
+values that updates fit and the values the targets use differ, and the
+learner diverged (reports/m5_capability.md).
+
+**Repair cycle 2** (SPEC §10, ``hns.marl.repair2``) tests learner variants
+for the roles in ``design_roles``; every other role keeps the settings
+above. ``baseline``, ``trunk_act`` and ``head_norm`` are the head variants of
+``hns.models.qnet``. ``backup = "hard"`` replaces the root target's soft
+value by ``max_{a in M_initiate(s')} Q_initiate^targ(s', a)``, so ``tau``
+only shapes the behaviour policy. ``replay = "archive"`` gives a fifth of the
+buffer to a lifetime reservoir (``hns.marl.buffer``). ``td`` is the loss
+form (``hns.models.qnet.td_loss``). Each role's update counts what it
+sampled, its per-branch squared errors and its gradient norms in
+``RoleLearner.stats`` (read and reset by :meth:`RoleLearner.pop_stats`), and
+raises ``FloatingPointError`` on a non-finite loss or gradient.
 
 **detector-T** (:class:`DetectorLearner`, the acting inspector):
 ``TD + L_DA + lambda_MARL L_adv`` in one gradient step.
@@ -73,12 +87,12 @@ import torch
 import torch.nn.functional as F
 
 from hns.data.norm import T_FIT_MAX_TS, Normalizer
-from hns.marl.buffer import Replay, VecReplay
+from hns.marl.buffer import ARCHIVE_SHARE, Replay, VecReplay
 from hns.marl.obs import (BRANCHES, D_CAND, D_W_AGENT, G_DIM, I_CTRL, L_CTRL, Featurizer, ObsBatch, collate,
                           detector_obs, merge, with_kind)
 from hns.models.detector import Detector, target_rows
 from hns.models.hrg import N_REL, ViewSampler, build_relations
-from hns.models.qnet import AgentQ, GlobalQ, root_value, soft_value, td_loss
+from hns.models.qnet import AgentQ, GlobalQ, root_max, root_value, soft_value, taken, td_loss
 from hns.sim.labels import ILLICIT, UNKNOWN
 from hns.sim.live import keep_mask
 from hns.transfer.adv import fgsm
@@ -95,8 +109,16 @@ class MarlConfig:
     batch: int = 128
     clip: float = 1.0
     dropout: float = 0.5         # the detectors' GAT (paper)
-    q_dropout: float = 0.5       # the launderer and innocent Q-networks (ours)
+    q_dropout: float = 0.0       # the launderer and innocent Q-networks (ours)
     target: str = "root"         # root | mean: the launderer and innocent bootstrap (ours, see above)
+    # repair cycle 2 (ours): learner variants, for the roles in design_roles; the first value of each is M5's
+    baseline: str = "shared"     # shared | independent: one V for all branches, or one per branch
+    backup: str = "soft"         # soft | hard: the root target's soft value, or its max
+    trunk_act: str = "relu"      # relu | leaky
+    head_norm: bool = False      # LayerNorm on the readout, before the head's trunk
+    replay: str = "fifo"         # fifo | archive
+    td: str = "mse"              # mse | huber | branch
+    design_roles: str = "launderer,innocent"
     beta: float = 0.01
     lam: float = 0.1             # lambda_MARL, preset (§8.4)
     fgsm_eps: float = 0.1
@@ -120,6 +142,20 @@ class MarlConfig:
             raise ValueError(f"unknown arm {self.arm}")
         if self.target not in ("root", "mean"):
             raise ValueError(f"unknown target {self.target}")
+        if (self.baseline not in ("shared", "independent") or self.backup not in ("soft", "hard")
+                or self.trunk_act not in ("relu", "leaky") or self.replay not in ("fifo", "archive")
+                or self.td not in ("mse", "huber", "branch")
+                or not set(self.design_roles.split(",")) <= {"launderer", "innocent", ""}):
+            raise ValueError("unknown learner variant")
+        if self.backup == "hard" and self.target != "root":
+            raise ValueError("the hard backup is defined for the root target")
+
+    def design(self, role: str) -> dict:
+        """The learner variant of ``role``: the configured one inside ``design_roles``, M5's otherwise."""
+        keys = ("baseline", "backup", "trunk_act", "head_norm", "replay", "td")
+        if role in self.design_roles.split(","):
+            return {k: getattr(self, k) for k in keys}
+        return {k: MarlConfig.__dataclass_fields__[k].default for k in keys}
 
     @property
     def da(self) -> bool:
@@ -159,15 +195,19 @@ class RoleLearner:
         if next(iter(self.branches)) != "initiate":
             raise ValueError("the root target needs initiate as the first branch")
         ptr = {"recipient": D_CAND} if role == "launderer" else None
+        self.design = d = cfg.design(role)
         self.net = AgentQ(self.branches, 17, D_W_AGENT, L_CTRL if role == "launderer" else I_CTRL, pointer=ptr,
-                          dropout=cfg.q_dropout).to(device)
+                          dropout=cfg.q_dropout,
+                          head={"baseline": d["baseline"], "act": d["trunk_act"], "norm": d["head_norm"]}).to(device)
         self.targ = _target_of(self.net)
         _amp(cfg, self.net.enc, self.targ.enc)
         self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr)
         self.sizes = self.net.sizes
-        self.buf = Replay(cfg.buffer, self.sizes)
+        arch = int(ARCHIVE_SHARE * cfg.buffer) if d["replay"] == "archive" else 0
+        self.buf = Replay(cfg.buffer - arch, self.sizes, arch, seed=[cfg.seed, 3, int(role == "launderer")])
         self.tail: dict[int, int] = {}     # agent -> id of its newest buffer entry (this world)
         self.n_updates = 0
+        self.pop_stats()
 
     def _q(self, net, ob: ObsBatch, masks: np.ndarray) -> torch.Tensor:
         g, f = ob.tensors(self.device)
@@ -176,21 +216,22 @@ class RoleLearner:
 
     @torch.no_grad()
     def q_values(self, ob: ObsBatch, masks: np.ndarray) -> np.ndarray:
+        """``Q`` of every option for acting; a non-finite value at a feasible option raises."""
         self.net.eval()
-        return self._q(self.net, ob, masks).cpu().numpy()
+        q = self._q(self.net, ob, masks).cpu().numpy()
+        if not np.isfinite(q[masks]).all():
+            raise FloatingPointError(f"{self.role}: non-finite Q at a feasible option")
+        return q
 
     def next_value(self, q2: torch.Tensor, next_active: torch.Tensor) -> torch.Tensor:
         """``F(s')`` of the configured target, from the target network's ``Q(s', .)``."""
         if self.cfg.target == "root":
-            return root_value(q2, self.sizes, self.cfg.tau)
+            return root_max(q2, self.sizes) if self.design["backup"] == "hard" else root_value(q2, self.sizes, self.cfg.tau)
         return soft_value(q2, self.sizes, next_active, self.cfg.tau)
 
-    def update(self, rng: np.random.Generator) -> float | None:
-        """One TD step on a replay batch; ``None`` during warm-up."""
+    def batch_target(self, b: dict) -> torch.Tensor:
+        """``y = r + gamma ** gap (1 - d) F(s')`` of a replay batch."""
         cfg, dev = self.cfg, self.device
-        if self.buf.ready < cfg.warmup:
-            return None
-        b = self.buf.sample(cfg.batch, rng)
         y = _t(b["reward"], dev)
         if b["next_obs"]:
             with torch.no_grad():
@@ -198,16 +239,67 @@ class RoleLearner:
                 v2 = self.next_value(q2, _t(b["next_active"], dev))
             y = y.clone()
             y[_t(~b["done"], dev)] += cfg.gamma ** _t(b["gap"], dev).to(y.dtype) * v2
+        return y
+
+    def pop_stats(self) -> dict:
+        """The update statistics since the last call, as plain numbers; resets them."""
+        st, nb = getattr(self, "stats", None), len(self.branches)
+        self.stats = {"n": 0, "rows": 0, "archive_rows": 0, "clipped": 0, "grad": 0.0, "grad_max": 0.0, "grad_enc": 0.0,
+                      "grad_head": 0.0, "sq": np.zeros(nb), "cnt": np.zeros(nb), "coef": np.zeros(nb),
+                      "options": np.zeros(sum(self.sizes), np.int64)}
+        if not st or not st["n"]:
+            return {"n": 0}
+        n, o = st["n"], np.concatenate([[0], np.cumsum(self.sizes)])
+        return {"n": n, "archive_share": st["archive_rows"] / st["rows"], "clip_share": st["clipped"] / n,
+                "grad_norm": st["grad"] / n, "grad_norm_max": st["grad_max"], "grad_norm_encoder": st["grad_enc"] / n,
+                "grad_norm_head": st["grad_head"] / n,
+                # per branch: realized rows per batch, their mean squared error, the weight of the branch's squared
+                # errors in the loss (summed over a batch's rows), and how often each option was sampled
+                "branch_rows": dict(zip(self.branches, (st["cnt"] / n).tolist())),
+                "loss_coef": dict(zip(self.branches, (st["coef"] / n).tolist())),
+                "branch_mse": dict(zip(self.branches, (st["sq"] / np.maximum(st["cnt"], 1)).tolist())),
+                "sampled_options": {b: st["options"][o[i]:o[i + 1]].tolist() for i, b in enumerate(self.branches)}}
+
+    def update(self, rng: np.random.Generator) -> float | None:
+        """One TD step on a replay batch; ``None`` during warm-up."""
+        cfg, dev = self.cfg, self.device
+        if self.buf.ready < cfg.warmup:
+            return None
+        b = self.buf.sample(cfg.batch, rng)
+        y = self.batch_target(b)
         self.net.train()
         q = self._q(self.net, collate(b["obs"]), b["masks"])
-        loss = td_loss(q, self.sizes, _t(b["action"], dev), _t(b["realized"], dev), y)
+        action, realized = _t(b["action"], dev), _t(b["realized"], dev)
+        loss = td_loss(q, self.sizes, action, realized, y, self.design["td"])
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.net.parameters(), cfg.clip)
+        with torch.no_grad():
+            sq = ((y.unsqueeze(1) - taken(q, self.sizes, action, realized)) ** 2 * realized).sum(0)
+            g_enc = torch.sqrt(sum((p.grad ** 2).sum() for p in self.net.enc.parameters() if p.grad is not None))
+        g = torch.nn.utils.clip_grad_norm_(self.net.parameters(), cfg.clip)
+        loss_v, g_v = float(loss.detach()), float(g)
+        if not (math.isfinite(loss_v) and math.isfinite(g_v)):
+            raise FloatingPointError(f"{self.role}: non-finite loss or gradient at update {self.n_updates}")
         self.opt.step()
         _polyak(self.net, self.targ, cfg.polyak)
         self.n_updates += 1
-        return float(loss.detach())
+        st, o = self.stats, np.concatenate([[0], np.cumsum(self.sizes)])
+        st["n"] += 1
+        st["rows"] += len(y)
+        st["archive_rows"] += b["n_archive"]
+        st["clipped"] += g_v > cfg.clip
+        st["grad"] += g_v
+        st["grad_max"] = max(st["grad_max"], g_v)
+        st["grad_enc"] += float(g_enc)
+        st["grad_head"] += math.sqrt(max(g_v ** 2 - float(g_enc) ** 2, 0.0))
+        r = b["realized"].astype(np.float64)
+        st["coef"] += (np.concatenate([[1.0], 0.25 * r[:, 1:].any(0)]) if self.design["td"] == "branch"
+                       else (r / r.sum(1, keepdims=True)).mean(0))
+        st["sq"] += sq.cpu().numpy()
+        st["cnt"] += b["realized"].sum(0)
+        for i in range(len(self.sizes)):
+            st["options"][o[i]:o[i + 1]] += np.bincount(b["action"][b["realized"][:, i], i], minlength=self.sizes[i])
+        return loss_v
 
     def end_world(self) -> None:
         """World end: every agent's last transition is terminal."""

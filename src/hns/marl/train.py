@@ -51,7 +51,7 @@ from hns.eval.rf_anchor import git_sha
 from hns.marl.learner import DetectorLearner, MarlConfig, RealViews, RoleLearner, SimW
 from hns.marl.obs import Featurizer, detector_obs, innocent_obs, launderer_obs, pack_masks, world_readout
 from hns.models.qnet import sample_actions
-from hns.sim.entities import STRATEGIES
+from hns.sim.entities import AMOUNTS, GO, STRATEGIES
 from hns.sim.env import SimEnv
 from hns.sim.export import export_world
 from hns.sim.labels import ILLICIT, UNKNOWN
@@ -195,9 +195,13 @@ class Trainer:
         self.fz = Featurizer(stats_t)
         self.roles = {r: RoleLearner(r, cfg, device) for r in ("launderer", "innocent")}
         self.det = DetectorLearner(cfg, device, self.fz, len(norm_w.stats["wallet_W"]), real_t, real_w)
-        self.rng = np.random.default_rng([cfg.seed, 1])     # exploration, replay and batch sampling
+        self.rng = np.random.default_rng([cfg.seed, 1])     # behaviour: every role's exploration
+        self.replay_rng = np.random.default_rng([cfg.seed, 2])   # replay and batch sampling (its own stream, so a
+        #                                                          replay variant leaves the exploration draws alone)
+        self.after_update = None    # optional callable(trainer), run after each sub-step's updates (diagnostics)
         self.policies = (_AgentPolicy(self, "launderer", 1), _AgentPolicy(self, "innocent", 2), _DetectorPolicy(self))
         self.world, self.step_no, self.episode = 0, 0, 0
+        self.world_step, self.launches = 0, np.zeros((len(STRATEGIES), len(AMOUNTS), 2), np.int64)   # this world's
         self.gvec = np.zeros(8, np.float32)
         self.last: dict = {}
         self.epochs: list[dict] = []
@@ -227,6 +231,15 @@ class Trainer:
             ep[f"r_{tr.role}"] += tr.reward
             if tr.role == "launderer":
                 ep["r_launderer_tranche"] += tr.reward_tranche      # M5's first reward, a diagnostic (§9.3)
+                # what the launderers did (repair cycle 2's logs): decisions by state and outcome, launches by
+                # strategy x amount x change, and the world's reward discounted per sub-step from the world's start
+                idle = len(tr.branches) > 1
+                kind = "noop" if tr.noop else ("go" if tr.action["initiate"] == GO else "wait")
+                ep[f"l_{'idle' if idle else 'flight'}_{kind}"] += 1
+                ep["l_idle_no_launch"] += idle and not tr.masks["initiate"][GO]
+                ep["r_launderer_disc"] += self.cfg.gamma ** (self.step_no - self.world_step) * tr.reward
+                if idle and kind == "go":
+                    self.launches[tr.action["strategy"], tr.action["amount"], tr.action["change"]] += 1
         inn = self.roles["innocent"]
         for i, r in res.continuation_rewards.items():
             if "innocent" in self.learn and i in inn.tail:
@@ -279,14 +292,14 @@ class Trainer:
             if name not in self.learn:
                 continue
             t0 = time.perf_counter()
-            v = L.update(self.rng)
+            v = L.update(self.replay_rng)
             self.sec[f"update_{name}"] += time.perf_counter() - t0
             if v is not None:
                 losses[f"td_{name}"].append(v)
         if "detector" not in self.learn:
             return
         t0 = time.perf_counter()
-        d = self.det.update(self.rng, self.view_seed(4))
+        d = self.det.update(self.replay_rng, self.view_seed(4))
         self.sec["update_detector_t"] += time.perf_counter() - t0
         for k, v in (d or {}).items():
             losses[f"t_{k}"].append(v)
@@ -301,6 +314,7 @@ class Trainer:
         env.graph = LiveGraph()
         self.det.pool.begin(env.graph, env_seed, params.mask_rate)
         self.last = {}
+        self.world_step, self.launches = self.step_no, np.zeros((len(STRATEGIES), len(AMOUNTS), 2), np.int64)
         losses, tot = defaultdict(list), defaultdict(float)
         u0, ratio, t_world = self.det.n_updates, [], time.perf_counter()
         for e in range(EPISODES):
@@ -315,6 +329,8 @@ class Trainer:
                 self.after_step(env, res, ep)
                 self.sec["env"] += time.perf_counter() - t0
                 self.update(losses)
+                if self.after_update is not None:
+                    self.after_update(self)
                 self.step_no += 1
             env.end_episode()
             ratio.append(ep["illicit"] / max(ep["licit"], 1.0))
@@ -338,7 +354,7 @@ class Trainer:
             sim = SimW(export_world(env), self.norm_w, cfg, env_seed, params.mask_rate)
             if sim.n:
                 for j in range(n_w):
-                    for k, v in self.det.update_w(sim, self.rng, self.view_seed(5) + 16 * j).items():
+                    for k, v in self.det.update_w(sim, self.replay_rng, self.view_seed(5) + 16 * j).items():
                         losses[f"w_{k}"].append(v)
             self.sec["detector_w"] += time.perf_counter() - t0
         mean = {k: float(np.mean(v)) for k, v in losses.items()}
@@ -352,7 +368,9 @@ class Trainer:
             "reward": {"launderer": tot["r_launderer"] / params.n_launderers / EPISODES,
                        "innocent": tot["r_innocent"] / params.n_innocents / EPISODES,
                        "detector": tot["r_detector"] / EPISODES,
-                       "launderer_tranche": tot["r_launderer_tranche"] / params.n_launderers / EPISODES},
+                       "launderer_tranche": tot["r_launderer_tranche"] / params.n_launderers / EPISODES,
+                       # per launderer, the world's reward discounted per sub-step from the world's start
+                       "launderer_discounted": tot["r_launderer_disc"] / params.n_launderers},
             "detection_rate": tot["cash_flag"] / max(tot["cash"], 1.0),
             "illicit_licit_ratio": float(np.mean(ratio)),
             **btc_fractions(env),
@@ -365,6 +383,10 @@ class Trainer:
                              "mask_rate": params.mask_rate, "offset": params.offset, "n_innocents": params.n_innocents},
             "export": {"n_tx": sim.n_tx, "n_labelled_wallets": sim.n} if sim is not None else None,
             "losses": mean,
+            "launderer": {"decisions": {k[2:]: int(v) for k, v in tot.items() if k.startswith("l_")},
+                          "launches": self.launches.tolist()},
+            "learner": {name: L.pop_stats() for name, L in self.roles.items() if name in self.learn},
+            "replay": {name: L.buf.support() for name, L in self.roles.items() if name in self.learn},
             "updates": {"launderer": self.roles["launderer"].n_updates, "innocent": self.roles["innocent"].n_updates,
                         "detector_t": self.det.n_updates, "detector_w": self.det.n_w_updates},
             "buffer": {"launderer": self.roles["launderer"].buf.ready, "innocent": self.roles["innocent"].buf.ready,
@@ -417,7 +439,8 @@ class Trainer:
                    "counters": {"step_no": self.step_no, "n_updates": D.n_updates, "n_w_updates": D.n_w_updates,
                                 "launderer": self.roles["launderer"].n_updates,
                                 "innocent": self.roles["innocent"].n_updates},
-                   "epochs": self.epochs, "rng": self.rng.bit_generator.state, "rng_cpu": torch.get_rng_state(),
+                   "epochs": self.epochs, "rng": self.rng.bit_generator.state,
+                   "rng_replay": self.replay_rng.bit_generator.state, "rng_cpu": torch.get_rng_state(),
                    "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
         tmp = path.with_suffix(".tmp")
         torch.save(ck, tmp, pickle_protocol=5)
@@ -438,6 +461,7 @@ class Trainer:
         D.n_updates, D.n_w_updates = c["n_updates"], c["n_w_updates"]
         self.roles["launderer"].n_updates, self.roles["innocent"].n_updates = c["launderer"], c["innocent"]
         self.rng.bit_generator.state = ck["rng"]
+        self.replay_rng.bit_generator.state = ck["rng_replay"]
         torch.set_rng_state(ck["rng_cpu"])
         if ck["rng_cuda"] is not None and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(ck["rng_cuda"])
