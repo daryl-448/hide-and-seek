@@ -33,6 +33,10 @@ passes. No other learner, curriculum, block-budget or reading condition changes.
 not a block, showed the per-pass guard undoing the first pass of every natural world, so the actor never changed
 once timing was released; the choice used training-update mechanics only, no evaluation world.)
 
+**Full-0's first attempt (2026-11-12 21:06) was voided** by the user: another job on the machine (a Rust build) starved
+it after world 9 and the cap cut it before any reading; it is kept as ``OPPO_full0_s0_stalled1``. The block was run
+again, unchanged.
+
 **A block is one attempt**: one opponent, training and reading together, under a 45-minute cap on the local GPU
 (``scripts/m5_repair2.sh oppo OPP``). ``run`` records that it started and refuses to start again; a block cut by the
 cap, or aborted, is incomplete, never promising. ``read`` exists only to finish the reading of a block whose training
