@@ -495,7 +495,7 @@ def test_role_targets_bootstrap_their_branches_at_gamma_per_sub_step(tmp_path, m
     tr.run()
     seen = {}
 
-    def fake_td(q, sizes, action, realized, y, kind="mse"):
+    def fake_td(q, sizes, action, realized, y, kind="mse", root_w=None):
         seen["y"] = y.detach().clone()
         return (torch.where(torch.isfinite(q), q, torch.zeros_like(q)) * 0.0).sum()
 
@@ -871,8 +871,9 @@ def test_repair2_calibration_matches_the_hard_and_the_soft_return():
     assert calibrate([(0, 1, 0, 0.0, None)], g, tau) == {"n": 0}
 
 
-def _world_rows(utility, reward=None):
-    return [{"btc_utility": u, "reward": u if reward is None else r} for u, r in zip(utility, reward or utility)]
+def _world_rows(utility, reward=None, held=0.1):
+    return [{"btc_utility": u, "reward": u if reward is None else r, "held_frac": held}
+            for u, r in zip(utility, reward or utility)]
 
 
 def test_repair2_gates_and_the_selection_rule():
@@ -981,7 +982,8 @@ def test_repair2_an_aborted_confirmation_seed_fails_the_cycle(tmp_path, monkeypa
     r2.cmd_confirm_eval(A)                                      # no snapshot is loaded for an aborted run
     assert json.loads((r2.run_dir("IHF", "nda1", 2) / "confirm.json").read_text())["status"].startswith("aborted")
     cal = {"n": 5, "bias_hard": 0.0, "g_abs_hard": 1.0, "q_max": 1.0}
-    ev = {k: [{"btc_utility": 0.5, "reward": 0.5, "cal": cal, "q_cap": 5.0}] * 8 for k in ("boltzmann", "argmax", "matched", "reference")}
+    ev = {k: [{"btc_utility": 0.5, "reward": 0.5, "cal": cal, "q_cap": 5.0, "held_frac": 0.1}] * 8
+          for k in ("boltzmann", "argmax", "matched", "reference")}
     for opp in r2.OPPS:
         for seed in (0, 1, 2):
             if (opp, seed) != ("nda1", 2):
@@ -989,6 +991,39 @@ def test_repair2_an_aborted_confirmation_seed_fails_the_cycle(tmp_path, monkeypa
     con = r2.confirmation({"cell": "IHF", "reference_world": 24})
     assert not con["pass"] and con["opps"]["nda1"] == {"aborted": ["seed 2: aborted: non-finite Q"], "pass": False}
     assert "p2" in con["opps"]["full0"]
+
+
+def test_repair2_confirmation_requires_utilization(tmp_path, monkeypatch):
+    from hns.marl import repair2 as r2
+
+    monkeypatch.setattr(r2, "RUNS", tmp_path)
+    jit = np.linspace(-0.02, 0.02, 8)
+    refs = {"wait": _world_rows([0.0] * 8, [-0.05] * 8), "direct50": _world_rows([0.6] * 8, held=0.08),
+            "repeat50": _world_rows([0.7] * 8), "uniform": _world_rows([-0.9] * 8)}
+    for opp in r2.OPPS:
+        for pol in r2.REFS:
+            r2.ref_path(opp, "confirmation", pol).write_text(json.dumps({"eval": refs[pol]}))
+    cal = {"n": 5, "bias_hard": 0.0, "g_abs_hard": 1.0, "q_max": 1.0}
+
+    def write(held):                                            # one held share per seed, the same against both
+        for opp in r2.OPPS:
+            for seed in (0, 1, 2):
+                d = r2.run_dir("IHF", opp, seed)
+                d.mkdir(exist_ok=True)
+                (d / "result.json").write_text(json.dumps({"cell": "IHF", "opp": opp, "seed": seed, "status": "ok",
+                                                           "accounting_gap_max": 0.0, "zero_trunk_share": 0.0}))
+                nat = [{"btc_utility": 0.4 + j, "reward": 0.4 + j, "cal": cal, "q_cap": 5.0, "held_frac": held[seed]}
+                       for j in jit]
+                ev = {"boltzmann": nat, "argmax": nat, "matched": _world_rows(list(-0.5 + jit)), "reference": nat}
+                (d / "confirm.json").write_text(json.dumps({"status": "ok", "eval": ev}))
+        return r2.confirmation({"cell": "IHF", "reference_world": 24})
+
+    con = write((0.12, 0.12, 0.12))                             # 0.04 over direct50's held share: within 0.05
+    assert con["pass"] and math.isclose(con["opps"]["full0"]["held_over_direct50"][0], 0.04, abs_tol=1e-9)
+    con = write((0.1, 0.1, 0.25))                               # the seeds' mean per world: 0.07 over it
+    assert not con["pass"] and not con["opps"]["nda1"]["pass"]
+    assert math.isclose(con["opps"]["nda1"]["held_over_direct50"][0], 0.07, abs_tol=1e-9)
+    assert con["opps"]["nda1"]["p2"] and con["opps"]["nda1"]["p3"]                       # only utilization fails
 
 
 def test_repair2_references_share_one_launch_schedule_and_repeat50_relaunches(monkeypatch):
@@ -1023,6 +1058,12 @@ def test_repair2_policies_panel_and_safety_check(tmp_path, monkeypatch):
     n_le = TINY.n_launderers * 2
     m = r2.play(tr, r2.Net(tr, "matched", sched=np.random.default_rng(0)), 100)
     assert math.isclose(m["tranches"], 1.0) and m["decisions"]["idle_go"] == n_le       # one launch each, per episode
+    assert math.isclose(m["ep_launch_share"], 1.0)
+    assert sum(v[0] for v in m["hazard"].values()) == sum(v[0] for v in m["gate"].values())   # the same idle decisions
+    for o, k in ((1, "idle"), (4, "flight")):                   # tried minus no-ops is what the simulator executed
+        assert sum(v[o] - v[o + 1] for v in m["hazard"].values()) == m["decisions"].get(f"{k}_go", 0)
+        assert sum(v[o + 1] for v in m["hazard"].values()) == m["decisions"].get(f"{k}_noop", 0)
+    assert sum(v[3] for v in m["hazard"].values()) == sum(m["decisions"].get(f"flight_{k}", 0) for k in ("go", "wait", "noop"))
     assert m["decisions"].get("flight_wait", 0) == 0 and abs(m["accounting_gap"]) < 1e-9
     a1, a2 = (r2.play(tr, r2.Net(tr, "argmax"), 100) for _ in range(2))
     assert a1 == a2 and a1["cal"]["bias_soft"] == a1["cal"]["bias_hard"]                # argmax: no entropy, no sampling
@@ -1090,13 +1131,14 @@ def test_wealth_scale_changes_the_output_and_the_loss_only(tmp_path, monkeypatch
     assert torch.allclose(L.batch_target(b), y, atol=1e-5)
     seen = {}
 
-    def fake_td(q, sizes, action, realized, y, kind="mse"):
-        seen["y"], seen["q"] = y.detach().clone(), q.detach().clone()
+    def fake_td(q, sizes, action, realized, y, kind="mse", root_w=None):
+        seen["y"], seen["q"], seen["root_w"] = y.detach().clone(), q.detach().clone(), root_w
         return (torch.where(torch.isfinite(q), q, torch.zeros_like(q)) * 0.0).sum()
 
     monkeypatch.setattr(lm, "td_loss", fake_td)
     L.update(np.random.default_rng(3))                          # draws the same batch
     assert torch.allclose(seen["y"], y / m, atol=1e-5) and torch.allclose(seen["q"][fin], q[fin], atol=1e-6)
+    assert seen["root_w"] is None                               # PL's loss: every branch divided by m(s)^2
     st = tr.epochs[-1]["learner"]["launderer"]
     assert st["scale_mean"] > 1 and st["scale_max"] >= st["scale_mean"]
     assert all(st["branch_mse_norm"][k] <= st["branch_mse"][k] + 1e-12 for k in st["branch_mse"])
@@ -1107,6 +1149,41 @@ def test_wealth_scale_changes_the_output_and_the_loss_only(tmp_path, monkeypatch
         _trainer(tmp_path, monkeypatch, "nda", episodes=2, scale="wealth", out_name="both")
 
 
+def test_root_weight_scales_the_root_term_only(tmp_path, monkeypatch):
+    from hns.marl import learner as lm
+
+    sizes = [2, 3]
+    q = torch.tensor([[1.0, 2.0, 0.5, 0.0, 1.5], [0.0, 0.0, 3.0, 1.0, 0.0]])
+    action, realized = torch.tensor([[1, 2], [0, 0]]), torch.tensor([[True, True], [True, False]])
+    y, w = torch.tensor([3.0, 1.0]), torch.tensor([2.0, 5.0])
+    want = ((2 * (3 - 2) ** 2 + (3 - 1.5) ** 2) / 2 + 5 * (1 - 0) ** 2) / 2
+    assert math.isclose(float(td_loss(q, sizes, action, realized, y, root_w=w)), want, rel_tol=1e-6)
+    assert math.isclose(float(td_loss(q, sizes, action, realized, y, root_w=torch.ones(2))),
+                        float(td_loss(q, sizes, action, realized, y)), rel_tol=1e-6)
+    for bad in ({"root_weight": "m"}, {"root_weight": "x", "scale": "wealth"},
+                {"root_weight": "m", "critic": "joint", "backup": "hard", "trunk_act": "leaky"}):
+        with pytest.raises(ValueError):
+            MarlConfig(**bad)
+    tr = _trainer(tmp_path, monkeypatch, "nda", episodes=2, scale="wealth", root_weight="m", design_roles="launderer")
+    tr.run()
+    L = tr.roles["launderer"]
+    assert L.design["root_weight"] == "m" and tr.roles["innocent"].design["root_weight"] == "none"
+    b = L.buf.sample(tr.cfg.batch, np.random.default_rng(3))
+    m = torch.from_numpy(lm.wealth_scale(collate(b["obs"]).x_c))
+    seen, real = {}, lm.td_loss
+
+    def spy(q, sizes, action, realized, y, kind="mse", root_w=None):
+        seen["root_w"] = root_w
+        return real(q, sizes, action, realized, y, kind, root_w)
+
+    monkeypatch.setattr(lm, "td_loss", spy)
+    L.update(np.random.default_rng(3))                          # draws the same batch
+    assert torch.allclose(seen["root_w"].cpu(), m) and (m > 1).any()
+    coef = L.pop_stats()["loss_coef"]["initiate"]               # the root's coefficient now carries m(s)
+    r = b["realized"].astype(np.float64)
+    assert math.isclose(coef, float((m.numpy() / r.sum(1)).mean()), rel_tol=1e-5)
+
+
 def test_stage1_cells_offline_fit_and_choice():
     from hns.marl import repair2 as r2, stage1 as s1
     from hns.marl.learner import WEALTH_REF
@@ -1115,6 +1192,7 @@ def test_stage1_cells_offline_fit_and_choice():
         "baseline": "independent"} and not set(r2.STAGE_CELLS) & set(r2.CELLS)
     assert r2.STAGE_CELLS["J"] == r2.CELLS["A"] | {"critic": "joint", "backup": "hard", "trunk_act": "leaky"}
     assert r2.STAGE_CELLS["PL"] == r2.STAGE_CELLS["P"] | {"trunk_act": "leaky"}
+    assert r2.STAGE_CELLS["PLR1"] == r2.STAGE_CELLS["PL"] | {"root_weight": "m"} and s1.BASE["PLR1"] == "PL"
     for c in r2.STAGE_CELLS.values():
         MarlConfig(**c)
     torch.manual_seed(0)
@@ -1214,6 +1292,41 @@ def test_stage1_reading_of_a_run_and_the_gate_table():
            (2, 1, r2.WAIT, 0.0, (0.0, NEG, 0.0, True, 3.5, d, half)), (3, 1, r2.GO, 0.0, (0.0, 0.1, 0.0, False, 3.5, d, half)),
            (4, 2, r2.WAIT, 0.0, None)]
     assert r2.gate_table(dec) == {"low": [1, 1, 1, 1], "mid": [0, 0, 0, 0], "high": [1, 0, 0, 1]}
+    # the hazard table: by band and world-time bin, idle decisions with a feasible launch and in-flight ones
+    late = [(1000 + 495, 1, r2.GO, 0.0, (0.0, 0.1, 0.0, True, 3.5, d, half)),
+            (1000 + 260, 2, r2.WAIT, 0.0, (0.0, 0.1, 0.0, False, 0.5, d, half))]
+    hz = r2.hazard_table([(s + 1000, *x) for s, *x in dec] + late, 1000, frozenset({(1001, 1)}))
+    # the no-op at step 1001 is recorded as a wait but was a launch that failed
+    assert hz["low/0"] == [1, 1, 0, 0, 0, 0] and hz["high/0"] == [1, 1, 1, 1, 1, 0] and hz["high/4"] == [1, 1, 0, 0, 0, 0]
+    assert hz["low/1"] == [0, 0, 0, 1, 0, 0] and sum(sum(v) for v in hz.values()) == 10
+
+
+def test_stage1_reported_measures(tmp_path, monkeypatch):
+    from hns.marl import repair2 as r2, stage1 as s1
+
+    monkeypatch.setattr(r2, "RUNS", tmp_path)
+
+    def rows(u, held, cal_bias=0.1):
+        cal = {"n": 10, "bias_soft": cal_bias, "bias_soft_btc": 2 * cal_bias, "idle": {"n": 6, "bias_soft": cal_bias},
+               "flight": {"n": 4, "bias_soft": -cal_bias}, "bal_high": {"n": 0}}
+        return [{"world": j, "btc_utility": x, "held_frac": h, "success_frac": 0.5, "frozen_frac": 0.1, "fee_frac": 0.0,
+                 "tranches": 1.0, "ep_launch_share": 0.5, "cal": cal, "hazard": {"low/0": [2, 1, 0, 0, 0, 0]}}
+                for j, x, h in zip(s1.DEV_WORLDS, u, held)]
+
+    pol, d50 = rows([0.4] * 4, [0.3, 0.2, 0.3, 0.2]), rows([0.6] * 4, [0.1] * 4)
+    u = s1.utilization(pol, d50)
+    assert np.allclose(u["held_over_direct50"]["differences"], [0.2, 0.1, 0.2, 0.1])
+    assert math.isclose(u["held_over_direct50"]["interval"][0], 0.15) and u["ep_launch_share"] == [0.5] * 4
+    st = s1.strata(pol)
+    assert st["hazard"] == {"low/0": [8, 4, 0, 0, 0, 0]} and st["calibration"]["idle"]["n"] == 24
+    assert math.isclose(st["calibration"]["idle"]["bias_soft"], 0.1) and math.isclose(st["calibration"]["flight"]["bias_soft"], -0.1)
+    assert st["calibration"]["bal_high"] == {"n": 0, "bias_soft": None} and math.isclose(st["calibration"]["btc_weighted"], 0.2)
+    assert s1.versus(pol, "PL", "full0") is None and s1.versus(pol, "PLR1", "full0") is None     # no base, no block
+    d = r2.run_dir("PL", "full0", 0)
+    d.mkdir(parents=True)
+    (d / "stage1.json").write_text(json.dumps({"snaps": {"30": rows([0.3, 0.5, 0.2, 0.4], [0.5] * 4)[::-1]}}))
+    v = s1.versus(pol, "PLR1", "full0")
+    assert np.allclose(v["differences"], [0.1, -0.1, 0.2, 0.0]) and math.isclose(v["base_held"], 0.5)
 
 
 def test_stage1_block_is_one_attempt(tmp_path, monkeypatch):

@@ -122,11 +122,68 @@ snapshot on the same four worlds at the training epsilon of 0.05 and reports its
 (reported, not gated; under epsilon the entropy-matched return is not an exact identity). Promising leads to
 ``PL`` against Full-0 as its own block.
 
+**Outcome of ``PL``'s blocks** (2026-11-11; runs/repair2/PL_*_s0/stage1.json). Against NDA-1 it is promising, the
+first learner to meet all four criteria, but thinly: world-30 utility +0.33 (bar +0.29), reward +0.283 (bar
++0.269). Against Full-0 it is not (criteria 2 and 4): utility +0.23 where the bar is +0.40 (``A``'s final minus
+0.02), and ``Q`` above the return by 1.23. Both hold about half of the proceeds at world end (NDA 49 %, Full 56 %;
+``direct50`` 7 to 9 %): launderers over 19 BTC launch at under 1 % of their idle decisions. A fourth Sol consult
+(runs/sol_consult/CONSULT4.md, read-only probes) found that against Full-0 rich waits are valued 2.2 above their
+realized return with a small one-step error, while against NDA-1 they are about calibrated; that launches are
+under-valued in both (in three same-state forks ``Q_go`` was 0.3 to 0.75 where the launch returned 3.0 to 4.2,
+with ``direct`` at 50 % already sampled); and that rich ``go`` rows carry 24 % / 33 % of the root's squared error
+in reward units but 3 % / 5 % of it under the wealth scale's ``1 / m(s)^2``. Its replays also showed that four
+GPU evaluation worlds can move by up to 0.08 utility between numerically equivalent paths.
+
+**Cell ``PLR1``: ``PL`` with the root's error divided by ``m(s)``** (declared 2026-11-12 before its run; the
+consult's section B1, approved by the user the same day). One factor away from ``PL``: ``root_weight = "m"``
+(``hns.marl.learner``), so a transition's loss is
+``[(y - Q_root)^2 / m(s) + sum_{realized launch branches b} (y - Q_b)^2 / m(s)^2] / |R(s, a)|``. Everything else is
+``PL``'s: ``Q = m(s) q``, the behaviour policy ``softmax(Q / 0.01)``, the one-step soft root target, the LeakyReLU
+trunk, the shared value stream, the root's ``1 / |R|``, FIFO replay, optimizer, schedule, seed 0 and its common
+initial weights, the same 30 worlds and frozen opponents. Expected mechanism (an inference, not a result): the
+change acts mostly through rich launch rows, whose errors are of order 2 to 3; a rich wait's one-step error is of
+order 0.03, so its larger weight changes little. The consult's offline fit on frozen features improved Full-0's
+BTC-weighted root error by 28 % and NDA-1's by 3 %: a bet, not a verified repair.
+
+One block against **Full-0 first** (the opponent ``PL`` fails), one attempt (``run``), with a 25-minute cap for
+training and reading together (``scripts/m5_repair2.sh stage1``; the four earlier blocks took 16 to 18 minutes, and
+a cut block is not run again). Read exactly as ``PL``'s block: the four criteria with the modal-row check, and
+the reported replay at epsilon 0.05. Against Full-0, criterion 2 needs utility at least +0.402 and reward at least
++0.323. Also reported, not gated (``reported``, in stage1.json):
+
+- utilization of the world-30 snapshot, per world and on average, next to ``direct50``'s on the same worlds: where
+  the proceeds went (cashed, frozen, fees, held), held minus ``direct50``'s held (with its paired interval),
+  launches per launderer and episode, and the share of launderer-episodes with a launch;
+- per source-balance band and world-time bin (sub-steps 0-249, 250-399, 400-449, 450-489, 490-499): idle decisions
+  with a feasible launch, how many tried to launch and how many of those were no-ops; the same for in-flight
+  decisions and proceeding;
+- calibration (``Q - G``, soft) by stratum: idle and in flight, the three bands, the world's halves, BTC-weighted;
+- the world-30 utility minus ``PL``'s on the same opponent, per world, with its paired interval. With four worlds
+  and the numerical spread above, a difference of a few hundredths is not a finding.
+
+After the block, outside its cap, on CPU (``diag``; reported only): for ``PLR1`` and ``PL`` on the same opponent,
+the world-30 network's error against its own one-step target on the world-30 buffer (every rich entry plus 6,000
+others, weighted as in step 1), for the root by root action (wait, go, in flight) and band, in reward units, divided
+by ``m(s)`` and BTC-weighted, and for the launch branches; the buffer's finalized rich entries that end the world
+(by root action); and the training clip share per world.
+
+The held-funds requirement of the confirmation (``hns.marl.repair2``, added the same day) is not part of this
+progress label; held funds are reported so that it can be anticipated.
+
+What follows (agreed with the user before the run). Promising against Full-0: ``PLR1`` against NDA-1 as its own
+block, read the same way. Not promising: if the world-30 held share against Full-0 is still at least ``PL``'s
+minus 0.10 (rich launderers still wait), the next block is ``PL`` with a hard root target, Full-0 first; if it fell
+by more than that (they launch, and what they launch is what fails), ``PL`` with independent value streams,
+NDA-1 first. A numerical failure (criterion 1) is reported first and decides neither. Each next block is declared
+here before it runs. If it fails too, the next step is the user's decision; a structural change of the learner
+(one launch-timing decision per episode, or an actor-critic) would depart from SPEC's Algorithm 1.
+
 Usage::
 
     python -m hns.marl.stage1 offline --opp full0        (and nda1)
     python -m hns.marl.stage1 choose
-    scripts/m5_repair2.sh stage1 P nda1                  (stage1 run: train, then read; 45-minute cap)
+    scripts/m5_repair2.sh stage1 P nda1                  (stage1 run: train, then read; the block's cap)
+    python -m hns.marl.stage1 diag --cell PLR1 --opp full0   (after the block, CPU, reported only)
 """
 
 from __future__ import annotations
@@ -159,10 +216,11 @@ A_SLACK, RETAIN, MODAL_MAX = 0.02, 0.05, 0.05
 
 
 # ---------------------------------------------------------------------------- step 1: offline head fits
-def offline_data(opp: str, device, n_other: int = N_OTHER) -> dict:
-    """The fit's fixed inputs and targets from the legacy run's world-30 buffer and networks."""
-    out = r2.run_dir("A", opp, 0)
-    tr = r2.make("A", opp, 0, device)
+def offline_data(opp: str, device, n_other: int = N_OTHER, cell: str = "A") -> dict:
+    """The fit's fixed inputs and targets from a run's world-30 buffer and networks (step 1: the legacy run's);
+    ``pred``: that network's own taken values in reward units (0 at unrealized branches)."""
+    out = r2.run_dir(cell, opp, 0)
+    tr = r2.make(cell, opp, 0, device)
     r2.load_snapshot(tr, out / "snap" / f"w{r2.WORLDS:02d}.pt")
     L = tr.roles["launderer"]
     buf = torch.load(out / "snap" / f"replay_w{r2.WORLDS:02d}.pt", weights_only=False)
@@ -172,7 +230,7 @@ def offline_data(opp: str, device, n_other: int = N_OTHER) -> dict:
     pick = np.random.default_rng(0).choice(other, min(n_other, len(other)), replace=False)
     slots = np.concatenate([rich, pick])
     w = np.concatenate([np.ones(len(rich)), np.full(len(pick), len(other) / len(pick))])
-    keys = ("h", "y", "masks", "action", "realized", "cand", "x_c", "t")
+    keys = ("h", "y", "pred", "masks", "action", "realized", "cand", "x_c", "t", "done")
     parts = {k: [] for k in keys}
     L.net.eval()
     for i in range(0, len(slots), 256):
@@ -182,8 +240,10 @@ def offline_data(opp: str, device, n_other: int = N_OTHER) -> dict:
             g, f = ob.tensors(device)
             parts["h"].append(L.net.enc.encode(g, f["x_tx"], f["x_w"], x_c=f["x_c"]).cpu())
             parts["y"].append(L.batch_target(b).cpu())
+            act, rz = torch.from_numpy(b["action"]).to(device), torch.from_numpy(b["realized"]).to(device)
+            parts["pred"].append(L.taken_q(L.net, ob, b["masks"], act, rz).cpu())
         for k, v in (("masks", b["masks"]), ("action", b["action"]), ("realized", b["realized"]), ("cand", ob.cand),
-                     ("x_c", ob.x_c), ("t", b["t"])):
+                     ("x_c", ob.x_c), ("t", b["t"]), ("done", b["done"])):
             parts[k].append(torch.from_numpy(np.ascontiguousarray(v)))
     d = {k: torch.cat(v) for k, v in parts.items()}
     d["w"] = torch.from_numpy(w)
@@ -309,6 +369,45 @@ def read_run(res: dict, snaps: dict | None, a_final: list[dict], direct50: list[
     return out | {"promising": bool(out["c1"] and out["c2"] and out["c3"] and out["c4"])}
 
 
+BASE = {"PLR1": "PL"}                                # a cell's paired comparison in the reported part
+
+
+def utilization(rows: list[dict], d50: list[dict]) -> dict:
+    """Reported: where the proceeds went and how often launderers launched, per world, next to ``direct50``'s."""
+    out = {"worlds": [r["world"] for r in rows]}
+    for k in ("success_frac", "frozen_frac", "fee_frac", "held_frac", "tranches"):
+        out[k] = {"policy": r2._col(rows, k).tolist(), "direct50": r2._col(d50, k).tolist()}
+    over = r2._col(rows, "held_frac") - r2._col(d50, "held_frac")
+    out["held_over_direct50"] = {"differences": over.tolist(), "interval": list(_t95(over))}
+    out["ep_launch_share"] = [r.get("ep_launch_share") for r in rows]
+    return out
+
+
+def strata(rows: list[dict]) -> dict:
+    """Reported: the hazard table summed over the worlds, and the soft calibration bias by stratum pooled over
+    decisions (the BTC-weighted one averaged over worlds)."""
+    hz = {k: np.sum([r["hazard"][k] for r in rows if "hazard" in r], axis=0).tolist()
+          for k in (rows[0].get("hazard") or {})}
+    cal = {}
+    for k in ("idle", "flight", "bal_low", "bal_mid", "bal_high", "early", "late"):
+        n = sum(r["cal"][k]["n"] for r in rows if k in r["cal"])
+        b = sum(r["cal"][k]["bias_soft"] * r["cal"][k]["n"] for r in rows if k in r["cal"] and r["cal"][k]["n"])
+        cal[k] = {"n": int(n), "bias_soft": b / n if n else None}
+    cal["btc_weighted"] = float(np.mean([r["cal"]["bias_soft_btc"] for r in rows if r["cal"]["n"]]))
+    return {"hazard": hz, "calibration": cal}
+
+
+def versus(rows: list[dict], cell: str, opp: str) -> dict | None:
+    """Reported: the world-30 utility minus that of the base cell's block on the same opponent, per world."""
+    f = r2.run_dir(BASE[cell], opp, 0) / "stage1.json" if cell in BASE else None
+    if f is None or not f.exists() or json.loads(f.read_text())["snaps"] is None:
+        return None
+    base = _dev(json.loads(f.read_text())["snaps"][str(SNAPS[-1])])
+    d = r2._col(rows, "btc_utility") - r2._col(base, "btc_utility")
+    return {"base": BASE[cell], "differences": d.tolist(), "interval": list(_t95(d)),
+            "base_held": float(r2._col(base, "held_frac").mean())}
+
+
 def _dev(rows: list[dict]) -> list[dict]:
     by = {r["world"]: r for r in rows}
     return [by[j] for j in DEV_WORLDS]
@@ -356,13 +455,33 @@ def read(a) -> dict:
             except FloatingPointError:
                 explore = None
     a_final = _dev(json.loads((r2.run_dir("A", a.opp, 0) / "result.json").read_text())["eval"]["boltzmann"])
-    reading = read_run(res, snaps, a_final, _dev(r2._refs(a.opp, "selection")["direct50"]), argmax)
+    d50 = _dev(r2._refs(a.opp, "selection")["direct50"])
+    reading = read_run(res, snaps, a_final, d50, argmax)
     if snaps is not None and argmax is not None:
         reading["argmax_utility"] = float(np.mean([r["btc_utility"] for r in argmax]))
+    reported = None
+    if snaps is not None:                                      # reported only: none of it changes the reading
+        last = snaps[SNAPS[-1]]
+        reported = {"utilization": utilization(last, d50), **strata(last), "versus": versus(last, a.cell, a.opp)}
     (out / "stage1.json").write_text(json.dumps({"cell": a.cell, "opp": a.opp, "seed": a.seed, "reading": reading,
                                                   "snaps": None if snaps is None else {str(w): v for w, v in snaps.items()},
-                                                  "argmax": argmax, "explore": explore}, indent=1))
+                                                  "argmax": argmax, "explore": explore, "reported": reported}, indent=1))
     print(json.dumps(reading, indent=1))
+    if reported is not None:
+        u, v = reported["utilization"], reported["versus"]
+        print(f"world {SNAPS[-1]} (reported): held {np.mean(u['held_frac']['policy']):.3f} (direct50 "
+              f"{np.mean(u['held_frac']['direct50']):.3f}; over it by {u['held_over_direct50']['interval'][0]:+.3f}, "
+              f"95 % {u['held_over_direct50']['interval'][1]:+.3f} to {u['held_over_direct50']['interval'][2]:+.3f}); "
+              f"cashed {np.mean(u['success_frac']['policy']):.3f}, frozen {np.mean(u['frozen_frac']['policy']):.3f}; "
+              f"launches per launderer-episode {np.mean(u['tranches']['policy']):.2f}; launderer-episodes with a "
+              f"launch {np.mean([x for x in u['ep_launch_share'] if x is not None] or [np.nan]):.3f}")
+        print(f"calibration by stratum (soft, pooled): {reported['calibration']}")
+        print(f"hazard [idle feasible, tried to launch, no-op, in flight, tried to proceed, no-op] by band/time bin: "
+              f"{reported['hazard']}")
+        if v is not None:
+            print(f"minus {v['base']} at world {SNAPS[-1]}: {[round(x, 3) for x in v['differences']]}, mean "
+                  f"{v['interval'][0]:+.3f} (95 % {v['interval'][1]:+.3f} to {v['interval'][2]:+.3f}); "
+                  f"{v['base']} held {v['base_held']:.3f}")
     if snaps is not None:
         shown = {f"world {w}, sampled policy": (rows, "soft") for w, rows in snaps.items()}
         if argmax is not None:                                 # a hard target is calibrated on these, not on the above
@@ -380,6 +499,43 @@ def read(a) -> dict:
     return reading
 
 
+# ---------------------------------------------------------------------------- after a block: reported only
+def buffer_errors(cell: str, opp: str, device) -> dict:
+    """The world-30 network's error against its own one-step target on its world-30 buffer (every rich entry and
+    ``N_OTHER`` others, weighted as in step 1, all of them measured), the rich entries that end the world, and the
+    training clip share per world."""
+    d = offline_data(opp, device, cell=cell)
+    d["held"] = torch.ones(len(d["y"]), dtype=torch.bool)       # measure every sampled entry
+    out = measures(d, d["pred"])
+    x_c, a0, done = d["x_c"].numpy(), d["action"].numpy()[:, 0], d["done"].numpy()
+    rich = x_c[:, 1] >= RICH
+    kind = np.where(x_c[:, 0] > 0, "flight", np.where(a0 == GO, "go", "wait"))
+    out["rich_terminal"] = {k: int((rich & done & (kind == k)).sum()) for k in ("wait", "go", "flight")}
+    out["rich_entries"], out["entries"] = int(d["n_rich"]), int(d["n_rich"] + d["n_other"])
+    clip = {}
+    for line in (r2.run_dir(cell, opp, 0) / "metrics.jsonl").read_text().splitlines():
+        e = json.loads(line)
+        st = (e.get("learner") or {}).get("launderer") or {}
+        if st.get("n"):
+            clip.setdefault(e["world"] + 1, []).append(st["clip_share"])
+    out["clip_share"] = {w: float(np.mean(v)) for w, v in sorted(clip.items())}
+    return out
+
+
+def cmd_diag(a) -> None:
+    res = {}
+    for cell in (a.cell, BASE.get(a.cell)):
+        if cell is None or not (r2.run_dir(cell, a.opp, 0) / "snap" / f"replay_w{r2.WORLDS:02d}.pt").exists():
+            continue
+        res[cell] = m = buffer_errors(cell, a.opp, torch.device(a.device))
+        print(f"{cell} {a.opp}: root {m['root']:.3f}  root/m {m['root_norm']:.3f}  root BTC-weighted {m['root_btc']:.3f}  "
+              f"child {m['child']:.3f}; rich entries ending the world {m['rich_terminal']} of {m['rich_entries']}; "
+              f"clip share at worlds 20 / 30 {m['clip_share'].get(20)} / {m['clip_share'].get(30)}")
+        for k, v in m["by"].items():
+            print(f"    {k:12s} n {v['n']:6d}  root {v['root']:.3f}  root/m {v['root_norm']:.3f}")
+    (r2.run_dir(a.cell, a.opp, 0) / "stage1_diag.json").write_text(json.dumps(res, indent=1))
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -393,8 +549,12 @@ def main(argv=None) -> int:
     p.add_argument("--opp", choices=list(r2.OPPS), required=True)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p = sub.add_parser("diag")
+    p.add_argument("--cell", choices=list(r2.STAGE_CELLS), required=True)
+    p.add_argument("--opp", choices=list(r2.OPPS), required=True)
+    p.add_argument("--device", default="cpu")
     a = ap.parse_args(argv)
-    {"offline": cmd_offline, "choose": cmd_choose, "run": cmd_run}[a.cmd](a)
+    {"offline": cmd_offline, "choose": cmd_choose, "run": cmd_run, "diag": cmd_diag}[a.cmd](a)
     return 0
 
 

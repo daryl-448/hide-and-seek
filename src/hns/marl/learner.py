@@ -49,7 +49,10 @@ launderer can spend, at its source and at its tranche's holders, and
 ``q`` and ``Q(s, a) = m(s) q(s, a)``. Acting and the bootstrap use ``Q``, so
 the policy is still ``softmax(Q / tau)`` and ``y`` is unchanged; the loss fits
 ``q`` to ``y / m(s)``, which is the squared error of ``Q`` divided by
-``m(s)^2``.
+``m(s)^2``. ``root_weight = "m"`` (stage 1, under the wealth scale only)
+multiplies the root branch's term by ``m(s)``, so the root's squared error of
+``Q`` is divided by ``m(s)`` and the launch branches' still by ``m(s)^2``;
+the division by ``|R(s, a)|`` is unchanged.
 
 ``critic = "joint"`` (stage 1; launderers only) replaces the branching heads
 by :class:`hns.models.qnet.JointHeads`, a critic over complete actions. One
@@ -143,6 +146,7 @@ class MarlConfig:
     replay: str = "fifo"         # fifo | archive
     td: str = "mse"              # mse | huber | branch
     scale: str = "raw"           # raw | wealth: Q = m(s) q, the loss on q (launderers only)
+    root_weight: str = "none"    # none | m: the root's term of the wealth-scaled loss times m(s)
     critic: str = "branch"       # branch | joint: values per branch, or per complete action (launderers only)
     design_roles: str = "launderer,innocent"
     beta: float = 0.01
@@ -175,15 +179,17 @@ class MarlConfig:
             raise ValueError("unknown learner variant")
         if self.backup == "hard" and self.target != "root":
             raise ValueError("the hard backup is defined for the root target")
-        if self.critic not in ("branch", "joint"):
+        if self.critic not in ("branch", "joint") or self.root_weight not in ("none", "m"):
             raise ValueError("unknown learner variant")
+        if self.root_weight == "m" and (self.scale != "wealth" or self.critic != "branch"):
+            raise ValueError("the root weight is defined for the branching critic under the wealth scale")
         if self.critic == "joint" and (self.backup, self.trunk_act, self.baseline, self.td, self.scale, self.head_norm) != (
                 "hard", "leaky", "shared", "mse", "raw", False):
             raise ValueError("the joint critic has a hard target and a leaky trunk, and none of the head variants")
 
     def design(self, role: str) -> dict:
         """The learner variant of ``role``: the configured one inside ``design_roles``, M5's otherwise."""
-        keys = ("baseline", "backup", "trunk_act", "head_norm", "replay", "td", "scale", "critic")
+        keys = ("baseline", "backup", "trunk_act", "head_norm", "replay", "td", "scale", "root_weight", "critic")
         if role in self.design_roles.split(","):
             return {k: getattr(self, k) for k in keys}
         return {k: MarlConfig.__dataclass_fields__[k].default for k in keys}
@@ -393,12 +399,14 @@ class RoleLearner:
         ob = collate(b["obs"])
         m = self.scale_of(ob)
         action, realized = _t(b["action"], dev), _t(b["realized"], dev)
+        root_w = m.squeeze(1) if self.design["root_weight"] == "m" else None
         if self.joint:                                         # one value per transition: the taken action's
             qa = self.taken_q(self.net, ob, b["masks"], action, realized)
             loss = ((y - qa[:, 0]) ** 2).mean()
         else:
             q = self._q(self.net, ob, b["masks"], scaled=False)    # the network's output: Q, or q under the wealth scale
-            loss = td_loss(q, self.sizes, action, realized, y if m is None else y / m.squeeze(1), self.design["td"])
+            loss = td_loss(q, self.sizes, action, realized, y if m is None else y / m.squeeze(1), self.design["td"],
+                           root_w)
             qa = taken(q, self.sizes, action, realized)
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -427,9 +435,10 @@ class RoleLearner:
         if self.joint:                                         # the loss is one squared error per transition:
             launch = r[:, 1:].any(1)                             # the root's share is the rows that are no launch
             st["coef"] += np.concatenate([[1.0 - launch.mean()], (r[:, 1:] * launch[:, None]).mean(0)])
-        else:
-            st["coef"] += (np.concatenate([[1.0], 0.25 * r[:, 1:].any(0)]) if self.design["td"] == "branch"
-                           else (r / r.sum(1, keepdims=True)).mean(0))
+        else:                                                  # the coefficient on each branch's error of the output
+            w = r if root_w is None else r * np.concatenate([root_w.cpu().numpy()[:, None], np.ones_like(r[:, 1:])], 1)
+            st["coef"] += (np.concatenate([[w[:, 0].mean()], 0.25 * r[:, 1:].any(0)]) if self.design["td"] == "branch"
+                           else (w / r.sum(1, keepdims=True)).mean(0))
         st["sq"] += sq.cpu().numpy()
         st["sq_norm"] += sq_norm.cpu().numpy()
         st["m"] += float(m1.sum())

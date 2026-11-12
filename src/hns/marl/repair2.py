@@ -108,8 +108,13 @@ has the higher worst-opponent natural BTC utility on worlds 100 and 101 (a tie g
 **Confirmation.** The selected cell is trained again with launderer seeds 1 and 2 against both opponents, and
 all three seeds are evaluated on the confirmation worlds. Per opponent: P1 for every seed; P2 and P3 on the
 per-world means over the three seeds (8 world clusters, not 24 rows); the matched skill difference at least 0 in
-2 of the 3 seeds; and retention, the final network's natural BTC utility minus the reference snapshot's, with a
-paired 95 % t-interval above -0.05. The cycle passes if all hold against both opponents.
+2 of the 3 seeds; retention, the final network's natural BTC utility minus the reference snapshot's, with a
+paired 95 % t-interval above -0.05; and utilization (added 2026-11-12 with the user's acceptance, after stage 1
+and before any confirmation; the fourth Sol consult's proposal): the natural policy's held share of the proceeds
+minus ``direct50``'s, per world averaged over the three seeds, at most 0.05 on average over the 8 worlds (its
+paired 95 % t-interval is reported). The cycle passes if all hold against both opponents. A policy that holds
+much more than ``direct50`` can pass the floors while leaving most of its proceeds unspent, which says little
+about laundering.
 
 **After a pass**, one short live pilot (20 worlds per ecosystem, all three roles learning, from the selected
 seed-0 launderer and the M5 final inspector and innocents; world seeds 900 and 901; at most 4 h of local GPU
@@ -188,6 +193,7 @@ CELLS = {
 # one-factor variants of the legacy learner for the staged tests (hns.marl.stage1); not cells of the screen
 STAGE_CELLS = {"P": CELLS["A"] | {"scale": "wealth"}, "I": CELLS["A"] | {"baseline": "independent"},
                "PL": CELLS["A"] | {"scale": "wealth", "trunk_act": "leaky"},
+               "PLR1": CELLS["A"] | {"scale": "wealth", "trunk_act": "leaky", "root_weight": "m"},
                # the joint critic is a bundle, not one factor: its own head, a leaky trunk, a hard double target
                "J": CELLS["A"] | {"critic": "joint", "backup": "hard", "trunk_act": "leaky"}}
 ALL_CELLS = CELLS | STAGE_CELLS
@@ -202,6 +208,7 @@ COLLAPSE, LOSS = 0.5, 0.25                              # share of idle panel st
 REFS = ("wait", "uniform", "direct50", "repeat50")
 Q_ABORT, CHECK_EVERY = 1e4, 100
 DEAD_MAX, ACCT_MAX, SKILL_MIN, TIE, RETAIN = 0.01, 1e-6, 0.02, 0.02, 0.05
+HELD_SLACK = 0.05        # confirmation (2026-11-12): held share at most direct50's plus this, in proceeds fractions
 SWEEP_TAUS = (0.005, 0.03)
 
 
@@ -337,6 +344,25 @@ def gate_table(dec: list[tuple]) -> dict:
     return out
 
 
+TIME_BINS = (250, 400, 450, 490)      # sub-steps of the world: 0-249, 250-399, 400-449, 450-489, 490-499
+
+
+def hazard_table(dec: list[tuple], start: int, noops: frozenset = frozenset()) -> dict:
+    """Per source-balance band (``BANDS``) and world-time bin (``TIME_BINS``; ``start``: the world's first step):
+    ``[idle decisions where a launch was feasible, of them tried to launch, of those no-ops, in-flight decisions,
+    of them tried to proceed, of those no-ops]``. ``noops``: the ``(step, agent)`` of no-op decisions, which the
+    simulator records as waits although only ``go`` proposes a tx; tried minus no-ops is what happened."""
+    out = {f"{k}/{b}": [0] * 6 for k in ("low", "mid", "high") for b in range(len(TIME_BINS) + 1)}
+    for s, i, a0, _, rec in dec:
+        if rec is None or (rec[3] and not math.isfinite(rec[1])):    # idle: only where a launch was feasible
+            continue
+        band = "low" if rec[4] < BANDS[0] else "mid" if rec[4] < BANDS[1] else "high"
+        row, o = out[f"{band}/{int(np.searchsorted(TIME_BINS, s - start, side='right'))}"], 0 if rec[3] else 3
+        noop = (s, i) in noops
+        row[o], row[o + 1], row[o + 2] = row[o] + 1, row[o + 1] + int(a0 == GO or noop), row[o + 2] + int(noop)
+    return out
+
+
 def play(tr: mt.Trainer, lpol, j: int) -> dict:
     """Held-out world ``j`` with launderer policy ``lpol`` against ``tr``'s frozen opponents; nothing learns."""
     learn, tr.learn = tr.learn, frozenset()
@@ -347,7 +373,7 @@ def play(tr: mt.Trainer, lpol, j: int) -> dict:
     tr.rng = np.random.default_rng([cap.EVAL_SALT, j, 1])      # the opponents' exploration and the policy's sampling
     tr.step_no, tr.last = cap.EVAL_STEP + j * EPISODES * SUBSTEPS, {}
     tr.world_step, tr.launches = tr.step_no, np.zeros((len(STRATEGIES), len(AMOUNTS), 2), np.int64)
-    tot, dec = defaultdict(float), []
+    tot, dec, launched, noops = defaultdict(float), [], set(), set()
     for e in range(EPISODES):
         env.start_episode(e)
         if tr.last:
@@ -359,6 +385,10 @@ def play(tr: mt.Trainer, lpol, j: int) -> dict:
                 if t.role == "launderer":
                     rec = lpol.rec.get((tr.step_no, t.agent)) if isinstance(lpol, Net) else None
                     dec.append((tr.step_no, t.agent, t.action["initiate"], t.reward, rec))
+                    if len(t.branches) > 1 and not t.noop and t.action["initiate"] == GO:
+                        launched.add((e, t.agent))                 # a launch that happened
+                    if t.noop:
+                        noops.add((tr.step_no, t.agent))
             tr.after_step(env, res, ep)
             tr.step_no += 1
         env.end_episode()
@@ -368,7 +398,7 @@ def play(tr: mt.Trainer, lpol, j: int) -> dict:
     n_le = params.n_launderers * EPISODES
     out = {"world": j, "n_launderers": params.n_launderers, "budget0": params.budget,
            "reward": tot["r_launderer"] / n_le, "reward_discounted": tot["r_launderer_disc"] / params.n_launderers,
-           "tranches": float(env.acct["strategy"].sum()) / n_le,
+           "tranches": float(env.acct["strategy"].sum()) / n_le, "ep_launch_share": len(launched) / n_le,
            "detection_rate": tot["cash_flag"] / max(tot["cash"], 1.0), **mt.btc_fractions(env),
            "decisions": {k[2:]: int(v) for k, v in tot.items() if k.startswith("l_")},
            "launches": tr.launches.tolist(),
@@ -376,6 +406,7 @@ def play(tr: mt.Trainer, lpol, j: int) -> dict:
     if isinstance(lpol, Net):
         out["cal"] = calibrate(dec, tr.cfg.gamma, tr.cfg.tau, tr.world_step + EPISODES * SUBSTEPS / 2)
         out["gate"] = gate_table(dec)
+        out["hazard"] = hazard_table(dec, tr.world_step, frozenset(noops))
         lpol.rec.clear()
     return out
 
@@ -538,6 +569,8 @@ class Diagnostics:
         e = (y.unsqueeze(1) - qa) ** 2 * realized              # squared residuals in reward units
         m = L.scale_of(ob)
         e_loss = e if m is None else e / m ** 2                # what the loss weighs: divided by m(s)^2 under the scale
+        if L.design["root_weight"] == "m":                     # and the root's by m(s) only
+            e_loss = torch.cat([e[:, :1] / m, e_loss[:, 1:]], 1)
         names = list(L.branches)
         si = names.index("strategy")
         n_launch = int(realized[:, si].sum())
@@ -853,15 +886,20 @@ def confirmation(sel: dict) -> dict:
         seeds_ok = int(((matched - _col(refs["uniform"], "btc_utility")).mean(1) >= 0).sum())
         keep = cap._t95(np.mean([_col(ev["boltzmann"], "btc_utility") - _col(ev["reference"], "btc_utility")
                                  for _, ev in runs], axis=0))
-        ok = all(x["p1"] for x in p1) and fl["p2"] and fl["p3"] and seeds_ok >= 2 and keep[1] > -RETAIN
-        out["opps"][opp] = {"p1": p1, **fl, "seeds_with_skill": seeds_ok, "retention": list(keep), "pass": bool(ok)}
+        held = cap._t95(np.mean([_col(ev["boltzmann"], "held_frac") for _, ev in runs], axis=0)
+                        - _col(refs["direct50"], "held_frac"))      # per world, over the seeds: 8 world clusters
+        ok = (all(x["p1"] for x in p1) and fl["p2"] and fl["p3"] and seeds_ok >= 2 and keep[1] > -RETAIN
+              and held[0] <= HELD_SLACK)
+        out["opps"][opp] = {"p1": p1, **fl, "seeds_with_skill": seeds_ok, "retention": list(keep),
+                            "held_over_direct50": list(held), "pass": bool(ok)}
     return out | {"pass": all(v["pass"] for v in out["opps"].values())}
 
 
 def cmd_confirm(a) -> None:
     res = confirmation(json.loads((RUNS / "selection.json").read_text()))
     (RUNS / "confirmation.json").write_text(json.dumps(res, indent=1))
-    print(json.dumps({o: {k: v[k] for k in ("aborted", "p2", "p3", "seeds_with_skill", "retention", "pass") if k in v}
+    print(json.dumps({o: {k: v[k] for k in ("aborted", "p2", "p3", "seeds_with_skill", "retention", "held_over_direct50",
+                                            "pass") if k in v}
                       for o, v in res["opps"].items()} | {"pass": res["pass"]}, indent=1))
 
 

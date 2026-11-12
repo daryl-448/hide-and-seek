@@ -281,17 +281,22 @@ def taken(q: torch.Tensor, sizes: list[int], action: torch.Tensor, realized: tor
 
 
 def td_loss(q: torch.Tensor, sizes: list[int], action: torch.Tensor, realized: torch.Tensor, y: torch.Tensor,
-            kind: str = "mse") -> torch.Tensor:
+            kind: str = "mse", root_w: torch.Tensor | None = None) -> torch.Tensor:
     """``mean_batch (1/|R(s,a)|) sum_{b in R(s,a)} e(y - Q_b(s, a_b))`` with ``e(d) = d^2`` (``mse``, §10).
 
     Repair cycle 2: ``huber`` keeps that average with ``e(d) = d^2`` for ``|d| <= 1`` and ``2|d| - 1`` beyond (twice
     the Huber loss of delta 1, so only the tail changes). ``branch`` weights by branch, not by transition:
     ``mean_batch d_root^2 + 0.25 sum_{b != root} mean_{rows that realize b} d_b^2``; a branch that no row of the
     batch realizes adds 0.
+
+    ``root_w`` (stage 1, ``(B,)``): multiplies each row's root error ``e(d_root)`` and nothing else; the division
+    by ``|R(s,a)|`` is unchanged.
     """
     d = y.unsqueeze(1) - taken(q, sizes, action, realized)
     r = realized.to(d.dtype)
     e = (2.0 * F.huber_loss(d, torch.zeros_like(d), reduction="none", delta=1.0) if kind == "huber" else d ** 2) * r
+    if root_w is not None:
+        e = torch.cat([e[:, :1] * root_w.to(e.dtype).unsqueeze(1), e[:, 1:]], 1)
     if kind == "branch":
         return e[:, 0].mean() + 0.25 * (e[:, 1:].sum(0) / r[:, 1:].sum(0).clamp_min(1)).sum()
     if kind not in ("mse", "huber"):

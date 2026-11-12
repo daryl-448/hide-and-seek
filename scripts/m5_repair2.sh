@@ -6,7 +6,8 @@
 #   scripts/m5_repair2.sh [JOBS=2]      logs: runs/repair2/logs/
 # Before the screen:  scripts/m5_repair2.sh stage0   (cell A against both opponents, then its timeline; about 45 min)
 # After a selection:  scripts/m5_repair2.sh confirm [JOBS=2]   (seeds 1 and 2, the confirmation worlds, the verdict)
-# Stage 1 (hns.marl.stage1): scripts/m5_repair2.sh stage1 CELL OPP   (one run and its reading, 45-minute GPU cap)
+# Stage 1 (hns.marl.stage1): scripts/m5_repair2.sh stage1 CELL OPP   (one run and its reading, 25-minute GPU cap;
+#   the blocks before PLR1 had 45 minutes)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 LOGS=runs/repair2/logs
@@ -24,9 +25,9 @@ if [ "${1:-}" = stage0 ]; then
   exit
 fi
 if [ "${1:-}" = stage1 ]; then          # one block, one attempt: train, then read worlds 20 and 30 (stage1 run)
-  timeout 2700 uv run python -m hns.marl.stage1 run --cell "$2" --opp "$3" >> "$LOGS/stage1_$2_$3.log" 2>&1
+  timeout 1500 uv run python -m hns.marl.stage1 run --cell "$2" --opp "$3" >> "$LOGS/stage1_$2_$3.log" 2>&1
   rc=$?
-  [ $rc -eq 0 ] || echo "stage 1 $2 $3: exit $rc (124 = cut by the 45-minute cap); the block is incomplete and is not run again"
+  [ $rc -eq 0 ] || echo "stage 1 $2 $3: exit $rc (124 = cut by the 25-minute cap); the block is incomplete and is not run again"
   exit $rc
 fi
 if [ "${1:-}" = confirm ]; then
