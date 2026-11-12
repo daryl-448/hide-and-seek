@@ -146,8 +146,8 @@ src/hns/
   data/   load.py audit.py ids.py graph.py causal.py split.py norm.py
   feats/  tx_feats.py wallet_feats.py   # the named-feature definitions, shared by real-data audit and simulator
   sim/    utxo.py world.py entities.py typologies.py env.py labels.py multiverse.py calibrate.py export.py
-  models/ hrg.py hrgat.py detector.py qnet.py sampler.py
-  marl/   buffer.py learner.py train.py
+  models/ hrg.py hrgat.py detector.py qnet.py policy.py sampler.py
+  marl/   buffer.py learner.py oppo.py train.py   # plus the capability and repair harnesses
   transfer/ finetune.py adv.py
   eval/   metrics.py js.py bootstrap.py report.py rf_anchor.py
 tests/              # unit tests, plus tiny synthetic fixtures. Never real data.
@@ -420,7 +420,7 @@ Each agent observes its 2-hop neighbourhood in an **agent-view HRG**: the T-view
 
 | Role | Count per world | Action `[...]` (Eqs. 16–17) | Reward (ours, magnitudes) |
 |---|---|---|---|
-| **Launderer** | `n_L` (multiverse). Each has 1 illicit source address holding the proceeds, plus a mule pool that grows on demand. | `initiate` ∈ {0, 1}, where 0 means wait. `amount` ∈ {10, 25, 50, 100} % of the source balance. `recipient` = a pointer over K = 16 **service** deposit addresses: the tranche's cash-out target. `strategy` ∈ 9 route templates (below), each ≤ 6 hops, executed one hop per sub-step and ending at the recipient. `mules` ∈ {fresh, reuse} for the route's intermediate addresses. `change` ∈ {fresh, reuse}. | Per sub-step, `(BTC cashed out at a service undetected − BTC newly frozen) / D_w`: `+r_success` and `−r_detected` measured in BTC, over the world's mean proceeds per launderer and episode `D_w` (below). `−0.001` per sub-step while funds remain. |
+| **Launderer** | `n_L` (multiverse). Each has 1 illicit source address holding the proceeds, plus a mule pool that grows on demand. | `initiate` ∈ {0, 1}, where 0 means wait. `amount` ∈ {10, 25, 50, 100} % of the source balance. `recipient` = a pointer over K = 16 **service** deposit addresses: the tranche's cash-out target. `strategy` ∈ 9 route templates (below), each ≤ 6 hops, executed one hop per sub-step and ending at the recipient. `mules` ∈ {fresh, reuse} for the route's intermediate addresses. `change` ∈ {fresh, reuse}. The launderer chooses these through options (below, ours). | Per sub-step, `(BTC cashed out at a service undetected − BTC newly frozen) / D_w`: `+r_success` and `−r_detected` measured in BTC, over the world's mean proceeds per launderer and episode `D_w` (below). `−0.001` per sub-step while funds remain. |
 | **Innocent** | 3k–6k individuals per world, each with 1–5 addresses. A scripted demand process makes about 2 % active per sub-step, each with a fixed recipient and amount. | `initiate` ∈ {now, defer}. `amount split` ∈ {1, 2, 3}. `route` ∈ {direct, forward via own second address, via service}. `change` ∈ {fresh, reuse}. The recipient is fixed by demand. | `+r_legit = 0.1` per executed tx. A **flagged (false-positive) tx is blocked for that sub-step** and earns no `r_legit`. This is the indirect false-positive cost that the paper leaves unspecified (G16). |
 | **Detector** | 1 | `select_tx`: flag the top-k of this sub-step's new txs by `Q_flag − Q_skip`. `analysis_depth` ∈ {1, 2} GAT hops (deeper messages are masked). `update_strategy` ∈ {−, 0, +}, which multiplies the budget fraction `b` by {0.8, 1, 1.25} within [1 %, 20 %]. | `+r_detect = 1.0` for each flagged illicit tx. `−r_miss = 1.0` for each unflagged illicit tx that pays a service (cash-out), and 0 for intermediate hops, which can still be caught later. `−r_false = 0.1` for each flagged licit tx. `−0.01 × depth` per investigated tx. |
 
@@ -431,17 +431,29 @@ Each agent observes its 2-hop neighbourhood in an **agent-view HRG**: the T-view
 - Without discounting and the holding cost, the launderers' mean episode reward is then exactly the world's **BTC utility**, `(cashed − frozen) / P_w`. A fixed amount earns the same whether it moves in one tranche or in ten.
 - M5's first runs (2026-11-10) used `(cashed − frozen tranche) / tranche` per hop instead. That pays up to +1 per tranche whatever its size, which rewards splitting, and it ignores frozen change. It stays logged as a diagnostic.
 - Neither form is Eq. 14 verbatim: the paper reports no magnitudes.
+- This reward is kept unchanged under the option policy below (2026-11-12). There is no capital-proportional holding charge, no deadline, no confiscation of funds held at world end, and no extra reward per tranche. Held funds, fees, frozen change and BTC utility stay separately reported.
+
+**Launderer options (ours; OPPO-MC, adopted 2026-11-12).** The launderer's physical actions above are unchanged. What changes is when and how it chooses them:
+- A launderer **decides** only when it is idle (no tranche in flight), holds funds at its source, and has no wait outstanding.
+- A decision is **wait** or **launch**:
+  - **wait** chooses a duration of {1, 5, 10, 25, 50} sub-steps. It is clipped at the episode's end, so new proceeds always end a wait, and durations that clip to the same length are offered once (the shortest original). The env sees `initiate = 0` at every sub-step of the wait;
+  - **launch** chooses a joint mode (`amount` × `strategy`, 4 × 9 = 36), then the `recipient`, `mules` and `change`, each conditioned on the mode. `mules` is irrelevant for `direct` and `peel`, and `change` at 100 %: an irrelevant choice is set to `fresh` and is not a decision. All of it is chosen in one sub-step.
+- **In flight, the launderer always proceeds**, every sub-step, until the route completes, is frozen, or the world ends. A no-op (the env could not execute the hop) simply retries at the next sub-step. There is no learned pause in flight.
+- After a route completes, the launderer can launch again at its next idle sub-step. There is no cap on launches per episode: launching `direct` at 50 % up to six times beats launching it once.
+- Feasibility masks, validation, no-ops and the atomic sub-step order (below) are unchanged. A decision that the env turns into a no-op is still recorded as the decision that was sampled (§10), not as a wait.
+- The same option rules, automatic progress in flight included, apply to every launderer policy: learned (Full, NDA), static (NMAI, §11), scripted references and controls.
+- Why (repair history, §10): the branching Q-learner had to value a launch through a gate over its own changing launch options, through long chains of one-sub-step waits and in-flight pauses. Options remove those chains; they do not change what a launderer can do with its funds, except pausing in flight and committing to a wait.
 
 **Action execution (feasibility masks `M_b` and templates):**
-- **Branch sets depend only on state.** For each role, the set of active branches `B(s)` and the per-option masks `M_b(s)` are functions of the state, never of the current action. This is what §10's target needs.
+- **Branch sets depend only on state.** For each role, the set of active branches `B(s)` and the per-option masks `M_b(s)` are functions of the state, never of the current action. This is what §10's Q target needs. The env's launderer branches and masks still follow this rule; the launderer's policy then chooses among them through options (above), whose later factors depend on the chosen mode. Its learner (§10) needs no branch set fixed by state.
   - **Launderer with no tranche in flight, and funds at the source:** `B(s) = {initiate, amount, recipient, strategy, mules, change}`. All six are chosen together in one sub-step.
-  - **Launderer with a tranche in flight:** `B(s) = {initiate}`, meaning proceed with the next hop now, or wait. The env executes the template's next hop.
+  - **Launderer with a tranche in flight:** `B(s) = {initiate}`, meaning proceed with the next hop now, or wait. The env executes the template's next hop. Under the options above the launderer always proceeds.
   - **Launderer with no funds left:** no transition is stored.
   - `M_b(s)` masks options that are infeasible in `s`: empty recipient slots, amounts whose payment would fall below 1e-5 BTC, and `mules = reuse` when the pool has fewer than k mules.
 - **Realized branches.** `R(s, a) ⊆ B(s)` is the set of branches whose choice took effect, and only these enter §10's loss.
   - If `initiate = 0`, then `R = {initiate}`.
   - At `amount = 100 %`, `change` is dropped, because there is no change output.
-  - For `direct`, `mules` is dropped.
+  - For `direct` and `peel`, `mules` is dropped: `direct` has no mules, and `peel`'s are always fresh. (This SPEC said `direct` only until 2026-11-12; the code has always dropped both.)
 - **A tranche** is funded only from the illicit source. `amount` applies to `source balance − fee`, with the fee taken first.
 - **Recipient** = one of K = 16 **service deposit addresses**, sampled uniformly from the world's services every sub-step. It is the tranche's cash-out target, and every route ends there. Intermediate addresses are never chosen by the pointer. They come from the `mules` branch: `fresh` creates new mule addresses, and `reuse` draws k from the pool uniformly.
 - **Hops.** One hop is one level of txs, all executed in the same sub-step. A hop spends all outputs held by the addresses it uses. `k ∼ U{2..5}` is drawn by the env, and is not an action.
@@ -550,12 +562,12 @@ The `size = 10 + 148·n_in + 34·n_out` formula matches the real median `size` w
 
 ## 10. MARL learner: Algorithm 1 made implementable (G7)
 
-**Learner choice.** We implement Algorithm 1's **per-role Q-learning with a TD loss plus `L_DA + λ L_adv`**, and not full MADDPG. The paper's equations and pseudocode describe Q-learning. MADDPG needs continuous or Gumbel-softmax actors, and nothing in the paper specifies them. The additions below fill gaps Algorithm 1 leaves open (G7), and each is labelled:
+**Learner choice.** We implement Algorithm 1's **per-role Q-learning with a TD loss plus `L_DA + λ L_adv`**, and not full MADDPG. The paper's equations and pseudocode describe Q-learning. MADDPG needs continuous or Gumbel-softmax actors, and nothing in the paper specifies them. The additions below fill gaps Algorithm 1 leaves open (G7), and each is labelled. **Launderers are the exception since 2026-11-12:** they learn with OPPO-MC, an on-policy actor-critic (below), and the Q-learning rules in this table apply to innocents and the inspector only.
 
 | Gap in Algorithm 1 | Our fill |
 |---|---|
 | `max_{a'}` over a structured action | **BDQ, the branching dueling Q-network** (Tavakoli et al. 2018), with per-branch values: `Q_b(s, a_b) = V(s) + A_b(s, a_b) − mean_{a ∈ M_b(s)} A_b(s, a)`, for each branch `b ∈ B(s)`. `B(s)` and `M_b(s)` depend on the state only (§9.3). The pointer branch's `A_b` scores candidates by attention. One `V` shared by all branches forces every branch's mean Q to be equal, which a launch's branches and `initiate` cannot satisfy together; repair cycle 2 (below) tests a value stream per branch, `Q_b = V_b(s) + A_b − mean A_b`. |
-| ENTROPY_COEF 0.01 matches no equation | It becomes the **soft-Q temperature** `τ = 0.01`. One shared target per transition: `y = r + γ^Δ (1 − d) · F(s')`, where `s'` is the agent's next decision point and `Δ` the number of sub-steps to it, so γ is per sub-step. For **launderers and innocents**, `F(s') = τ · logsumexp_{a ∈ M_initiate(s')} (Q_initiate^targ(s', a) / τ)`, the **root target** (ours). For the inspector's **global branches**, `F(s') = (1/|B(s')|) Σ_{b ∈ B(s')} τ · logsumexp_{a ∈ M_b(s')} (Q_b^targ(s', a) / τ)`. Both depend on `s'` alone, so no next-step action is needed. The loss is `(1/|R(s,a)|) Σ_{b ∈ R(s,a)} (y − Q_b(s, a_b))²`, the BDQ form with mean aggregation over the branches whose choice took effect (§9.3). The behaviour policy is softmax(Q_b / τ) per branch over `M_b`, combined with ε-greedy that decays from 1.0 to 0.05 over the first 300 episodes. As τ → 0 this is Algorithm 1's max. The soft value pays up to `τ ln 2` per decision for keeping `wait` and `go` equally good, up to 0.69 in total at γ = 0.99, which is the size of a launderer's whole return; repair cycle 2 tests the hard root target `F(s') = max_{a ∈ M_initiate(s')} Q_initiate^targ(s', a)`, with τ kept for the behaviour policy only. |
+| ENTROPY_COEF 0.01 matches no equation | For the Q learners it becomes the **soft-Q temperature** `τ = 0.01` (for the launderers since 2026-11-12, OPPO-MC's policy-loss entropy bonus instead, below). One shared target per transition: `y = r + γ^Δ (1 − d) · F(s')`, where `s'` is the agent's next decision point and `Δ` the number of sub-steps to it, so γ is per sub-step. For **launderers and innocents**, `F(s') = τ · logsumexp_{a ∈ M_initiate(s')} (Q_initiate^targ(s', a) / τ)`, the **root target** (ours). For the inspector's **global branches**, `F(s') = (1/|B(s')|) Σ_{b ∈ B(s')} τ · logsumexp_{a ∈ M_b(s')} (Q_b^targ(s', a) / τ)`. Both depend on `s'` alone, so no next-step action is needed. The loss is `(1/|R(s,a)|) Σ_{b ∈ R(s,a)} (y − Q_b(s, a_b))²`, the BDQ form with mean aggregation over the branches whose choice took effect (§9.3). The behaviour policy is softmax(Q_b / τ) per branch over `M_b`, combined with ε-greedy that decays from 1.0 to 0.05 over the first 300 episodes. As τ → 0 this is Algorithm 1's max. The soft value pays up to `τ ln 2` per decision for keeping `wait` and `go` equally good, up to 0.69 in total at γ = 0.99, which is the size of a launderer's whole return; repair cycle 2 tests the hard root target `F(s') = max_{a ∈ M_initiate(s')} Q_initiate^targ(s', a)`, with τ kept for the behaviour policy only. |
 
 **Why the root target (ours; revised after M5's first runs).** `initiate` is in `B(s)` and realized under every action, so it is the only branch that every transition trains. The other branches rank a launch's options and stay out of the bootstrap. The first version of this SPEC bootstrapped launderers and innocents through the mean over all of `B(s')`. But when an agent waits only `initiate` is realized, so five branches trained only on launches carried most of every idle state's target. In M5's first runs the launderer values inflated: `Q(wait)` reached 6.5–357, where no return above a few units was attainable (reports/m5_marl.md). This conditional BDQ variant is ours and has no general convergence guarantee. Those runs also discounted by γ per decision, so a 50-sub-step gap cost one γ; γ is now per sub-step.
 | `done` | `d = 1` only at **world end**. Time-step (episode) boundaries are bootstrapped through, because funds and addresses persist within a world. A detector `select_tx` flag transition is always terminal: `d = 1`, so `y = r`. |
@@ -563,8 +575,19 @@ The `size = 10 + 148·n_in + 34·n_out` formula matches the real median `size` w
 | No target network | A Polyak-averaged target network with rate 0.005. |
 | GRADIENT_CLIP 1.0 | Global-norm clip of 1.0 on each role's update. |
 
+**Launderer learner: OPPO-MC (ours; adopted 2026-11-12).** Repair cycle 2 and stage 1 (below) found no Q-learner variant that kept a profitable launderer policy against both frozen opponents. The fifth Sol consult (runs/sol_consult/CONSULT5.md) traced the common failure to valuing launches through a gate over the learner's own changing launch options and through long bootstrapped chains. OPPO-MC is on-policy PPO over the options of §9.3, with complete-world Monte Carlo returns. It departs from Algorithm 1 for the launderer only, and it is not MADDPG. The paper's "entropy bonus in policy learning" (ENTROPY_COEF) fits it more directly than a soft-Q temperature does.
+- **Networks.** An actor `π_θ` and a critic `V_φ`, each shared by all launderers, each with its own two-layer HRG-GAT (§8) over the agent view. They share no parameters. Each feeds its GAT readout through a LayerNorm and concatenates the controller features (§9.3), so the clock and the balances reach the heads directly. The actor has two 128-unit LeakyReLU(0.01) bodies: one for the gate and the wait duration, one for the launch factors. The critic has one. Dropout is 0. The actor's output layers start at zero, so the initial policy is uniform over the feasible choices: launch with probability 0.5, and every duration, mode, recipient, and relevant `mules` and `change` option equally likely.
+- **Policy.** `π(wait, d | o) = π_g(wait | o) π_d(d | o)`, and `π(launch, z, k, u, c | o) = π_g(launch | o) π_z(z | o) π_k(k | o, z) π_u(u | o, z)^{I_u(z)} π_c(c | o, z)^{I_c(z)}`. Here `z` is the mode (amount × strategy), `k` the recipient, `u` the mules and `c` the change, and `I_u`, `I_c` say whether that choice is relevant for `z` (§9.3). Each factor is a softmax over its feasible options; a mode is feasible if its amount is. An irrelevant factor, or one with a single feasible option, adds log-probability 0 and entropy 0.
+- **Returns.** A launderer's decisions `j`, at sub-steps `t_j`, form a chain. `R_j = Σ_{u=0}^{Δ_j − 1} γ^u r_{t_j + u}` adds up every reward that launderer gets from its decision up to its next one (`Δ_j = t_{j+1} − t_j`): waiting, hops in flight and the holding cost included. `G_j = R_j + γ^{Δ_j} G_{j+1}`, with γ = 0.99 per sub-step. World end is the only terminal: the last decision's `R` runs to the world's last sub-step, and nothing is added after it.
+- **Critic.** `V(o) = m(o) v(o)`, where `m(o) = 1 + M(o) / exp(1.5)` and `M(o)` is the BTC the launderer can spend (its source and its tranche's holders, each address once). Loss: `½ mean_j (v(o_j) − G_j / m(o_j))²`.
+- **Actor.** The advantage is `A_j = G_j − V_old(o_j)`: GAE with λ = 1, so no critic value enters a return. It is divided by one number per world, `s_A = max(0.001, √(mean_j A_j²))`, not per decision, so richer decisions keep their larger stakes. `ρ_j` is the new-to-old probability ratio of the complete sampled action. Loss: `−mean_j min(ρ_j Â_j, clip(ρ_j, 0.8, 1.2) Â_j) − 0.01 mean_j H(π_θ(· | o_j))`. `H` is the joint entropy by the chain rule, `H = H_g + p(wait) H_d + p(launch) [H_z + E_{z∼π_z}(H_{k|z} + I_u(z) H_{u|z} + I_c(z) H_{c|z})]`. No entropy enters `V` or `G`.
+- **Collection and updates.** Actor and critic stay fixed for a whole world. At its end every chain is closed, and then each network takes four passes over the world's decisions in random order: minibatches of 128 (micro-batched as memory requires), Adam with lr 3e-4 for each network, a gradient-norm clip of 1.0, fp32. The decision-time observation, masks, log-probability and value are stored and reused; nothing is resampled. No replay buffer, target network or Polyak averaging. A world with no decision updates nothing.
+- **KL guard.** After each actor pass, three mean KL divergences from the old policy to the new one are computed over the world's decisions: the joint policy's; the launch factors' given a launch, over every decision where a launch was feasible; and the duration's given a wait, over every decision with more than one duration. If the largest exceeds 0.02 nats, that pass is undone, the actor's Adam state included, and the actor takes no further pass in that world. The critic still takes its four.
+- **Curriculum.** In worlds 1–5 the gate is not learned. Each launderer launches once per episode, at its first idle sub-step on or after a sub-step drawn uniformly from [0, 43] where a launch is feasible, and otherwise waits. Only the launch factors are sampled from the actor and trained, from the same full-world returns. From world 6 the actor decides everything. These five worlds count inside MAX_EPISODES. There is no forced launch after world 5, no imitation of a script, and no ε-exploration.
+- **Logged** per world: launches by mode, recipient, mules and change; wait durations; decisions and launches by balance band and world time; no-ops; actor passes taken and undone; the three KLs; entropy; ratio and clip-fraction quantiles; gradient norms; the critic's error.
+
 **Which losses each role uses:**
-- Launderers and innocents use the TD loss only. They have no labels and nothing transfers from them.
+- Launderers use OPPO-MC's actor and critic losses (above). Innocents use the TD loss only. Neither has labels, and nothing transfers from them.
 - **detector-T** (it acts) uses `TD + L_DA + λ_MARL L_adv`, with `L_DA = L_y^src + L_aux` (§8.3).
   - `L_y^src` uses committed simulator txs with observed labels, in the T view.
   - `L_aux` also uses *unlabelled* real T-view txs from **ts 1–29 only**.
@@ -579,9 +602,11 @@ The `size = 10 + 148·n_in + 34·n_out` formula matches the real median `size` w
 **Transitions:**
 - Each per-tx `select_tx` flag decision is a one-step, terminal transition with `y = r`. A flag's outcome is known in the same sub-step.
 - The detector's global branches (`analysis_depth`, `update_strategy`) use the sub-step's summed detector reward, and bootstrap from the next sub-step's global readout.
-- Launderer transitions are per launderer per sub-step, observed from its controller node. Innocent transitions exist only on sub-steps when the innocent has a demand.
+- Launderer decisions are options (§9.3), observed from the launderer's controller node; their returns are OPPO-MC's (above). Innocent transitions exist only on sub-steps when the innocent has a demand.
 
-**Update schedule:** one gradient step per role per sub-step, on a batch of 128. Adam with lr 1e-3, γ = 0.99. Checkpoint every 25 episodes, including the full RNG state.
+**Update schedule:** innocents and the inspector take one gradient step per role per sub-step, on a batch of 128, with Adam at lr 1e-3; launderers update once per world (above). γ = 0.99. Checkpoint every 25 episodes, including the full RNG state.
+
+**Acting policies in live play (ours; adopted 2026-11-12, implemented before the live pilot).** During a live run, every role acts with a copy of its networks fixed at the start of each world, so a launderer's on-policy world faces opponents that do not change within it. The innocent and inspector learners keep their per-sub-step updates, with the same counts and losses, on shadow copies; detector-W trains on each world's export as before. The shadows become the acting networks at the next world's start, and so does the launderer's actor after its world-end update. NMAI's inspector follows the same cadence. Checkpoints hold the acting and shadow networks, the optimizers, the curriculum phase and every RNG stream, and a run resumes only from a complete world.
 
 **Health checks, logged every epoch (they replace Figs. 4–5):**
 - per-role mean episode reward;
@@ -593,18 +618,22 @@ The `size = 10 + 148·n_in + 34·n_out` formula matches the real median `size` w
 A run is **degenerate** if, over the last 20 epochs, either the detection rate or the launderer success fraction stays above 0.95 or below 0.05. A degenerate run is reported as such, as a warning. It no longer decides acceptance on its own.
 
 **Acceptance of a MARL run (ours; replaces the degenerate rule as the M5 gate).** M5's first runs passed the degenerate rule by the letter while their launderers had not learned: against their final inspectors, a scripted `direct` policy cashed out most of its proceeds, while the learned launderers chose templates that were almost always caught (reports/m5_marl.md, reports/m5_capability.md). A run passes if:
-1. **Complete:** 1,000 episodes, every loss finite, and the BTC accounting closes every epoch (gap ≤ 1e-6 of proceeds).
-2. **Calibrated values:** on held-out worlds at ε = 0, the mean of `Q_initiate(s, a) − G` over launderer decisions is within `max(0.5, 0.25 · mean |G|)`. `G` is the realized return from the decision, with γ per sub-step, to world end, and it matches the target (revised 2026-11-11: the first version compared a soft Q with a plain return). Under the soft root target the policy samples softmax(Q/τ) and `G` also counts the root entropy of every later decision, `G_t = r_t + γ^Δ (G_{t+1} + τ H(π_root(s_{t+1})))`. Under the hard root target the policy takes each branch's argmax and `G` is the plain return.
-3. **Adapted launderers:** the final launderers play 8 held-out multiverse worlds, the same for every policy compared, against the run's final inspector and innocents frozen at ε = 0.05. At **matched launch opportunities**, each launderer launches once per episode, at a sub-step drawn uniformly from [0, 43], and the network chooses every option. There the final launderers must beat (a) uniform option choices and (b) the run's own launderer snapshot at world 30, where ε reaches its floor, each by at least 0.02 in BTC utility. The paired 95 % t-interval over the worlds of all 3 seeds must lie above 0, and the mean difference must be ≥ 0 in at least 2 of the 3 seeds.
+1. **Complete:** 1,000 episodes; every loss, gradient, probability and value finite; no infeasible action sampled; and the BTC accounting closes every epoch (gap ≤ 1e-6 of proceeds).
+2. **Calibrated values** (revised 2026-11-12 for OPPO-MC; for each seed, never on seed means): on held-out worlds, the critic's `V` before each launderer decision against the plain return `G` from that decision (γ per sub-step, to world end), with the actor sampling as trained and no extra exploration. Per world `w`, `b_w = mean (V − G)` and `a_w = mean |G|` over its decisions; the check is `|mean_w b_w| ≤ max(0.5, 0.25 · mean_w a_w)`, worlds weighted equally. The pooled and BTC-weighted bias, the RMSE and the bias by balance band and world time are reported. A calibrated critic does not show skill. (The Q-learners' version of 2026-11-11 compared `Q_initiate` with a soft return; it remains in repair2's history.)
+3. **Adapted launderers** (revised 2026-11-12): the final launderers play 8 held-out multiverse worlds, the same for every policy compared, against the run's final inspector and innocents frozen at ε = 0.05. Every difference below is paired by world: per world, the mean over the 3 seeds, and a 95 % t-interval over the 8 worlds.
+   - **Natural economics.** The natural policy (the actor decides everything) has positive BTC utility, on the seed mean and in at least 2 of the 3 seeds; its BTC utility and its reward are each at least half of scripted `direct` at 50 % once per episode (on the matched schedule below); and both are above waiting, with intervals above 0.
+   - **Utilization.** Its share of the proceeds still held at world end exceeds `direct` at 50 %'s by at most 0.05 on average. A policy can clear the floors while leaving most of its proceeds unspent.
+   - **Matched skill.** At **matched launch opportunities**, each launderer launches once per episode, at its first idle sub-step on or after a sub-step drawn uniformly from [0, 43], always proceeds in flight, and the actor chooses every launch factor. There the final launderers must beat uniform option choices and the untrained initial actor, each by at least 0.02 in BTC utility, with intervals above 0, and the difference to uniform must be ≥ 0 in at least 2 of the 3 seeds.
+   - **Retention.** Against the same final opponents, the final natural policy's BTC utility minus that of the run's own world-30 launderers has a lower 95 % bound above −0.05. This replaces "beat world 30 by 0.02": a learner that is competent before world 30 should not have to get worse first to qualify. No earlier peak substitutes for the final launderers.
 
 Reported, not gated:
-- the natural policy (the network also decides when to launch) against wait-only and the static (NMAI) launderers;
-- launch, proceed and detection rates;
+- the natural policy against the static (NMAI) launderers, and the actor's argmax policy;
+- launch, proceed and detection rates, and where the proceeds went;
 - the health curves.
 
 **Calling it co-evolution.** Adapting to a frozen inspector does not show feedback. A passing run is called co-evolved only if two checks on the same held-out worlds both give paired 95 % intervals above 0, pooled over seeds:
 - (a) the inspector responded: the final inspector freezes a larger share of the final launderers' proceeds than the world-30 inspector does;
-- (b) the launderers responded: against the final inspector, the final launderers earn more BTC utility than a **no-feedback control**, which is launderers trained from the world-30 snapshot for the same number of episodes against the world-30 inspector, frozen.
+- (b) the launderers responded: against the final inspector, the final launderers earn more BTC utility than a **no-feedback control**, which is launderers trained from the world-30 snapshot for the same number of episodes against the world-30 inspector, frozen. The control continues the same actor, critic and optimizers with the same update budget; it is not a weakened learner. Since its innocents are frozen too, (b) concerns the changed opponents together; attributing it to the inspector alone needs a fixed-innocent control.
 
 Otherwise the report says "adaptation shown, co-evolution not identified".
 
@@ -616,12 +645,19 @@ Otherwise the report says "adaptation shown, co-evolution not identified".
 - **Outcome.** A pass fixes the selected learner in this section and in §13, and the six runs are repeated. A failure at any step ends the cycle, and a new one is declared before anything else runs (§16). No cell, checkpoint or temperature is chosen from a training curve.
 - **Stage 0, before the screen.** The legacy learner alone is trained against both opponents with the cycle's snapshots and diagnostics. No fix is tested. `timeline` then reads, on two further held-out worlds, whether the trunk went inactive before the policy was lost. If the policy is lost while the trunk is still active, the trunk is not the cause, and the cells are revised before the screen.
 - **Stage 1** (`hns.marl.stage1`, whose docstring declares each block before it runs). Stage 0 showed the policy lost with the trunk still active, so the cells are revised one change at a time: each block trains one variant of the legacy learner for 30 worlds against one frozen opponent, one attempt under a fixed GPU cap, and is read on four development worlds as promising or not. A promising block is a reason for the next block, not an acceptance.
+- **Outcome.** Stage 1's blocks (P, J, PL against both opponents, PLR1) gave no learner that was promising against both. Its remaining blocks are superseded by OPPO-MC (2026-11-12); their verdicts stand.
+
+**OPPO-MC capability cycle (ours; declared 2026-11-12, before its runs).** The full declaration is the docstring of `hns.marl.oppo_block`; the learner is `hns.marl.oppo`. In short:
+1. **Development blocks.** A fresh OPPO-MC launderer (seed 0) trains for 30 worlds against the frozen Full seed 0 opponents, then, as its own block, against NDA seed 1's: one attempt each, under a 45-minute cap on the local GPU. The NDA block runs even if the Full block fails, unless the failure is a shared implementation fault. Each is read on development worlds 100–103 (already used by stage 1) from its world-20 and world-30 snapshots. A block is **promising** if all five hold: (1) sound: 30 complete worlds, everything finite, the stored old probabilities reproduced before each update, accounting closed; (2) natural economics: world-30 BTC utility positive and at least `max(½ direct50's, legacy A's final − 0.02)`, reward at least ½ `direct50`'s; (3) retention: world-30 minus world-20 BTC utility ≥ −0.05 on average; (4) the critic's calibration (acceptance item 2); (5) held share at most `direct50`'s + 0.05, and matched skill at least 0.02 over uniform.
+2. **Confirmation**, if both blocks are promising: the unchanged design with launderer seeds 1 and 2 against both opponents, all three seeds evaluated on 8 unused worlds (200–207), with acceptance item 2 checked for each seed separately and item 3's tests on per-world seed means. Retention there is against each seed's own world-20 snapshot.
+3. **Live pilot**: 40 fresh worlds per arm (Full, NDA), every role learning from scratch as in a definitive run, with a world-30 fork in which only the launderer continues for 10 worlds against frozen opponents. It is judged on acceptance item 3 against its own final opponents, with world 30 as the retention reference, on 8 further unused worlds.
+4. Only then the six runs (§15).
 
 ## 11. Transfer protocol
 
 1. **Pretrain.**
    - **Full:** the MARL run's final detector-T checkpoint (for T) and detector-W checkpoint (for W).
-   - **NMAI:** the same detector, trained for the same number of detector updates. It uses the same losses, including in-loop DA, but on data from the **static** simulator. That simulator has the same worlds, but launderers draw typologies uniformly and innocents use scripted routes, so nobody learns.
+   - **NMAI:** the same detector, trained for the same number of detector updates. It uses the same losses, including in-loop DA, but on data from the **static** simulator. That simulator has the same worlds, but launderers use the untrained OPPO-MC actor (§10) and innocents use scripted routes, so nobody learns. The untrained actor is uniform over its feasible choices, so it needs no network: it follows the same five-world launch schedule as Full's curriculum, then launches with probability 0.5 at each decision, picks wait durations, modes, recipients, mules and change uniformly, and always proceeds in flight (revised 2026-11-12; it was a uniform draw of every branch at every sub-step, with a random pause in flight). The static distributions are checked again (M4's conservation, feasibility and feature checks) before NMAI is pretrained.
    - **NDA:** a MARL run identical to Full, but with `L_DA` reduced to `L_y^src` (so `L_aux` is removed) and no real batches.
 2. **Export.** Run the final policies (or the static rules, for NMAI) on 100 multiverse worlds, which is 1,000 time-step graphs, matching the paper's 1,000 "graphs". Store the per-step components (§9.2). Then compute Q1's JS and our version of Table 2: nodes, edges, graphs, average degree reported as both E/N and 2E/N (G10), labelled fractions and class rates.
 3. **Fine-tune, separately for T and W.**
@@ -656,7 +692,7 @@ The pretraining runs are 3 Full, 3 NDA and 3 NMAI, one per seed. Each run produc
 
 **What Full − NMAI means here (ours; added after M5's first runs).**
 - Full, NDA and NMAI share every simulator mechanic: the generator, the proceeds schedules, the reward and accounting definitions, the label rules, the world draws and the number of detector updates.
-- In NMAI the inspector acts and trains exactly as in Full. Only the transaction agents do not learn: launderers draw typologies uniformly, and innocents use scripted routes.
+- In NMAI the inspector acts and trains exactly as in Full, with the same acting cadence (§10). Only the transaction agents do not learn: launderers use the untrained actor with the same launch curriculum and option rules as Full's (§11), and innocents use scripted routes.
 - Full also learns its innocents, so Full − NMAI measures the effect of the learned transaction agents as a whole. Attribute it to launderer–inspector feedback only if a control with scripted innocents in Full supports that, and only if the run passes §10's co-evolution check.
 
 **Deliverable:** `reports/results.md`, containing:
@@ -676,23 +712,30 @@ The pretraining runs are 3 Full, 3 NDA and 3 NMAI, one per seed. Each run produc
 |---|---|---|
 | MAX_EPISODES | 1000 | paper |
 | Episode / world / epoch | 1 time step of 50 sub-steps / 10 episodes / 1 world | ours (G8) |
-| Learning rate, optimizer | 1e-3, Adam | paper |
+| Learning rate, optimizer | 1e-3, Adam (innocents, inspector) | paper |
+| Launderer learning rate, optimizer | 3e-4, Adam, separately for actor and critic | ours (OPPO-MC) |
 | Discount γ | 0.99 | paper |
 | Batch size | 128 | paper |
 | Dropout | 0.5 (GAT features and attention) | paper |
-| Launderer / innocent Q-network dropout | 0. At 0.5 the values that updates fit (train mode) and the values the targets use (eval mode) differ, and the learner diverged in the capability test. | ours |
-| Launderer / innocent target | root: bootstrap through `initiate` only, γ per sub-step (§10). Soft or hard: PENDING repair cycle 2. | ours |
-| Launderer / innocent head, replay and TD loss | PENDING repair cycle 2 (§10). M5's first runs: one shared `V`, a ReLU trunk, 100k FIFO, squared error. | ours |
+| Launderer actor and critic, innocent Q-network dropout | 0. At 0.5 the values that updates fit (train mode) and the values the targets use (eval mode) differ, and the learner diverged in the capability test. | ours |
+| Innocent learner | M5's: branching Q with one shared `V`, a ReLU trunk, the soft root target (γ per sub-step), 100k FIFO, squared error over the realized branches (§10). Repair cycle 2's variants were for launderers and were not adopted. | ours |
+| Launderer learner | OPPO-MC (§10): separate actor and critic HRG-GATs, LayerNorm and controller skip, 128-unit LeakyReLU(0.01) bodies; options of §9.3 | ours; departs from Algorithm 1 |
+| Launderer options | wait durations {1, 5, 10, 25, 50} clipped at the episode's end; joint mode amount × strategy (36); recipient, mules, change conditioned on the mode; always proceed in flight; no launch cap | ours |
+| Launderer returns | complete world, GAE λ = 1, γ = 0.99 per sub-step, world end the only terminal | ours (γ: paper) |
+| Launderer critic | `V = m v`, `m = 1 + spendable BTC / exp(1.5)`; loss `½ (v − G/m)²` | ours |
+| Launderer PPO | one world per batch; 4 passes, minibatch 128; clip 0.2; advantages / world RMS; KL guard 0.02 nats, a pass undone with its Adam state | ours |
+| Launderer curriculum | worlds 1–5: scheduled launch once per episode at [0, 43], launch factors only; then the actor decides | ours |
 | Latent dims Z_s / Z_d / Z_n | 256 / 64 / 128 | paper |
 | β (KL weight) | 0.01 | paper |
-| ENTROPY_COEF | 0.01, used as the soft-Q temperature τ | paper value, our use (G7) |
+| ENTROPY_COEF | 0.01. Innocents and inspector: the soft-Q temperature τ. Launderers: the bonus on the joint (chain-rule) policy entropy in the actor's loss, outside `V` and `G` | paper value, our use (G7) |
 | GRADIENT_CLIP | 1.0 | paper |
 | λ (adversarial) | MARL: preset 0.1. Fine-tuning: {0.1, 0.5}, picked on each task's val. | ours |
 | Δ | FGSM ε = 0.1 (L∞, standardized), `p_miss` = 0.1 | ours |
 | HRG decay α | 0.5, exponent `|ΔL|` | ours (G4) |
 | GAT | 2 layers, 4 heads × 64, ELU | ours |
-| Replay buffer, warm-up, target-network rate | 100k, 1k, Polyak 0.005 | ours |
-| ε-greedy | 1.0 → 0.05 over 300 episodes | ours |
+| Replay buffer, warm-up, target-network rate | 100k, 1k, Polyak 0.005 (Q learners; the launderer has none) | ours |
+| ε-greedy | 1.0 → 0.05 over 300 episodes (Q learners; the launderer has none). Frozen opponents in capability tests act at 0.05 | ours |
+| Acting policies in live play | fixed per world for every role; innocent and inspector updates on shadow copies, promoted at the next world | ours |
 | Neighbourhood sampling | 10 / 5 per edge type for hops 1 / 2, cap 512 nodes | ours |
 | Rewards | §9.3 table | ours (G9) |
 | Fine-tune | ≤ 50 epochs, patience 5 on val illicit-F1, `pos_weight` = √(neg/pos) | ours |
@@ -709,8 +752,8 @@ The paper's gotchas G1–G16 are from the digest. E1–E20 are new.
 | G4 | Eq. 9's exponent is signed | Use `|L_i − L_j|`. | 8.1 |
 | G5 | Signs in Eqs. 20–21 | Minimize NLL + β·KL. δ maximizes the NLL. | 8.3–8.4 |
 | G6 | Eq. 20 is not a VGAE objective | Add recon, a domain head, and KL on Z_s and Z_n (each labelled as added). | 8.3 |
-| G7 | "MADDPG" vs Algorithm 1 | BDQ-style branching soft-Q per role (per-branch Q, one shared target per transition: the root branch for launderers and innocents, the branch mean for the inspector's global branches; feasibility masks, world-end terminal, γ per sub-step), with replay, a target network and parameter sharing. L_DA and L_adv apply to the detectors only. | 10 |
-| G8 | Episodes vs epochs | Episode = one time step, world = 10 episodes = 1 epoch. T = 50. `done` defined. | 9.2 |
+| G7 | "MADDPG" vs Algorithm 1 | Innocents and the inspector: BDQ-style branching soft-Q per role (per-branch Q, one shared target per transition: the root branch for innocents, the branch mean for the inspector's global branches; feasibility masks, world-end terminal, γ per sub-step), with replay, a target network and parameter sharing. Launderers (since 2026-11-12): OPPO-MC, on-policy PPO over options with complete-world returns, a declared departure from Algorithm 1 and not MADDPG. Parameters shared within each role. L_DA and L_adv apply to the detectors only. | 10 |
+| G8 | Episodes vs epochs | Episode = one time step, world = 10 episodes = 1 epoch. T = 50. `done` defined: world end only. A launderer's route, and the rewards between two of its decisions, may cross an episode boundary (waits stop at it); they are discounted per sub-step. | 9.2, 9.3 |
 | G9 | Unreported values | All set in §13 and §9.3 and marked (ours). | 13 |
 | G10 | Table 2 inconsistencies | The text's "822k wallets, 1.27M temporal interactions" matches the README: 822,942 wallets, 1,268,260 wallet rows. Table 2's 859,254 nodes and 995,508 edges match nothing we can derive. Our Table 2 analogue reports E/N *and* 2E/N. | 2, 11 |
 | G11 | Which simulator | The paper most likely ran IBM AMLSim: its Table 3 columns are AMLSim's historical output schema, although it cites AMLworld. We build an independent step-able UTXO-lite simulator with AMLSim-inspired templates and no AMLSim code: a method replication. AMLworld (no public code) is a design reference only. | 9.1 |
@@ -749,12 +792,12 @@ The paper's gotchas G1–G16 are from the digest. E1–E20 are new.
 | M2 | S0 RF anchor | Illicit F1 within ±0.03 of 0.828 (T) and 0.845 (W). Otherwise stop and fix the pipeline. | local | — |
 | M3 | T0 | Gate on **val**: T0's val illicit-F1 ≥ that of an RF refit on the *fitting split only*, minus 0.05, on both tasks. (S0 itself trains on official-train, which includes val.) Test is not looked at here. | local (1650S) or A30 | 2 A30-h |
 | M4 | Simulator, static mode, calibration | Unit tests on a hand-built ledger: conservation of BTC (`in = out + fee`), the flow edge rule, the label rules (E6), the shortcut guard (§9.4), every manifest definition and sentinel, feasibility masks, the sub-step order (reservation conflicts become no-ops; reverted txs leave no trace), and the export recompute. Calibration report. | local | — |
-| M5 | MARL Full, NDA (3 seeds each) | First, a declared repair cycle passes (currently cycle 2: `hns.marl.repair2`, reports/m5_repair2.md; the first capability test, `hns.marl.capability`, did not pass). Then: health curves present, and the §10 acceptance (complete with closed accounting, calibrated values, adapted launderers). The degenerate rule and the co-evolution check are reported. | A30 | ≈ 6 runs × 2.5 h = 15 h (first runs: 3.5–3.8 h each, six at once on one A30) |
+| M5 | MARL Full, NDA (3 seeds each, 1,000 episodes each) | First, the OPPO-MC capability cycle passes (§10: development blocks, confirmation, live pilot; `hns.marl.oppo`, `hns.marl.oppo_block`). Earlier cycles did not pass (`hns.marl.capability`, `hns.marl.repair2`, `hns.marl.stage1`; reports/m5_capability.md, reports/m5_repair2.md). Then: health curves present, and the §10 acceptance (complete with closed accounting, the critic's calibration, natural economics and utilization, matched skill, retention). The degenerate rule and the co-evolution check are reported. | local (capability), A30 (runs) | 15–30 GPU-job hours for the six runs (first runs: 3.5–3.8 h each, six at once on one A30); the new learner is benchmarked first |
 | M6 | NMAI pretrain, exports, JS | JS table, Fig. 6 analogue, Table 2 analogue. | A30 | 2 h |
 | M7 | Fine-tune grid (4 arms × 3 fractions × 3 seeds × 2 tasks, plus zero-shot) | All runs logged. `reports/results.md` generated by `hns.eval.report`. | A30, 4 processes in parallel | ≈ 4 h |
 | M8 | Optional: Q4 noise sweep, SRF, W-temporal, T0-shared, X2 (v1-only T) | — | A30 | ≤ 4 h |
 
-The total is about 25 A30-hours. M5's 2.5 h per run is an estimate: measure it on a 20-episode benchmark first, and re-plan from that. If M5 takes more than 4 h per run, cut it in this order: drop the NDA seeds to 1, then cut the sub-steps to T = 30.
+The total is about 25 A30-hours before M5's repairs. M5's per-run time with OPPO-MC is unknown: benchmark 20 episodes under the intended concurrency first, and re-plan from that (revised 2026-11-12). Keep three Full and three NDA seeds and T = 50 for acceptance. If the runs would exceed the approved budget, re-plan before running; a reduced study (fewer NDA seeds, shorter worlds) is declared and reported as such, never used to pass the same gate.
 
 ## 16. Risks and fallbacks
 
@@ -764,7 +807,8 @@ The total is about 25 A30-hours. M5's 2.5 h per run is an estimate: measure it o
     1. Freeze innocents to their scripted routes, so only two roles learn.
     2. Then shrink the strategy set.
     3. Then raise or lower the detector budget range.
-  - Each repair cycle is declared in advance. It ends with the capability test and a short live pilot before any full re-run. Cycle 1 (2026-11-10: the root target, γ per sub-step, the per-proceeds reward) did not pass the capability test. Cycle 2 is declared in §10.
+  - Each repair cycle is declared in advance. It ends with the capability test and a short live pilot before any full re-run. Cycle 1 (2026-11-10: the root target, γ per sub-step, the per-proceeds reward) did not pass the capability test. Cycle 2 and stage 1 (§10) gave no learner promising against both opponents. The current cycle is OPPO-MC (§10, 2026-11-12): it changes the launderer's estimator, credit and decision structure, not the rewards, budgets or labels.
+  - A failed or incomplete block is reported before the next one is declared; a block cut by its time cap is not a pass. Holding costs, forced liquidation, fewer templates or other budgets are changes to the game: consider them only as declared modelling hypotheses, applied to every simulator arm, with the references re-evaluated. Success against a frozen opponent shows neither feedback nor transfer.
   - **No stop rule** (removed 2026-11-11 at the user's direction; the first revision stopped after two cycles). Repair cycles continue until the §10 acceptance passes. Each is declared in advance and reported, whatever its outcome. Never choose an M5 variant or checkpoint after seeing an M7 target-test result.
 
   Report which fallbacks were used.

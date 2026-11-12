@@ -149,6 +149,7 @@ class MarlConfig:
     root_weight: str = "none"    # none | m: the root's term of the wealth-scaled loss times m(s)
     critic: str = "branch"       # branch | joint: values per branch, or per complete action (launderers only)
     design_roles: str = "launderer,innocent"
+    launderer: str = "q"          # q | oppo: the launderer's learner (OPPO-MC since 2026-11-12, hns.marl.oppo)
     beta: float = 0.01
     lam: float = 0.1             # lambda_MARL, preset (§8.4)
     fgsm_eps: float = 0.1
@@ -179,6 +180,8 @@ class MarlConfig:
             raise ValueError("unknown learner variant")
         if self.backup == "hard" and self.target != "root":
             raise ValueError("the hard backup is defined for the root target")
+        if self.launderer not in ("q", "oppo"):
+            raise ValueError(f"unknown launderer learner {self.launderer}")
         if self.critic not in ("branch", "joint") or self.root_weight not in ("none", "m"):
             raise ValueError("unknown learner variant")
         if self.root_weight == "m" and (self.scale != "wealth" or self.critic != "branch"):

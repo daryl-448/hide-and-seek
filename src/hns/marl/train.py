@@ -49,6 +49,7 @@ import yaml
 from hns.data.norm import NORM_DIR, Normalizer
 from hns.eval.rf_anchor import git_sha
 from hns.marl.learner import DetectorLearner, MarlConfig, RealViews, RoleLearner, SimW
+from hns.marl.oppo import CURRICULUM_WORLDS, OppoLearner, OptionPolicy
 from hns.marl.obs import Featurizer, detector_obs, innocent_obs, launderer_obs, pack_masks, world_readout
 from hns.models.qnet import sample_actions
 from hns.sim.entities import AMOUNTS, GO, STRATEGIES
@@ -193,13 +194,17 @@ class Trainer:
             raise ValueError("every frozen role needs a fixed epsilon")
         torch.manual_seed(cfg.seed)
         self.fz = Featurizer(stats_t)
-        self.roles = {r: RoleLearner(r, cfg, device) for r in ("launderer", "innocent")}
+        self.oppo = cfg.launderer == "oppo"          # the launderer learns with OPPO-MC (hns.marl.oppo)
+        self.roles = {"launderer": OppoLearner(cfg, device) if self.oppo else RoleLearner("launderer", cfg, device),
+                      "innocent": RoleLearner("innocent", cfg, device)}
         self.det = DetectorLearner(cfg, device, self.fz, len(norm_w.stats["wallet_W"]), real_t, real_w)
         self.rng = np.random.default_rng([cfg.seed, 1])     # behaviour: every role's exploration
         self.replay_rng = np.random.default_rng([cfg.seed, 2])   # replay and batch sampling (its own stream, so a
         #                                                          replay variant leaves the exploration draws alone)
         self.after_update = None    # optional callable(trainer), run after each sub-step's updates (diagnostics)
-        self.policies = (_AgentPolicy(self, "launderer", 1), _AgentPolicy(self, "innocent", 2), _DetectorPolicy(self))
+        lpol = (OptionPolicy(self, self.roles["launderer"], np.random.default_rng([cfg.seed, 11]),
+                             np.random.default_rng([cfg.seed, 12])) if self.oppo else _AgentPolicy(self, "launderer", 1))
+        self.policies = (lpol, _AgentPolicy(self, "innocent", 2), _DetectorPolicy(self))
         self.world, self.step_no, self.episode = 0, 0, 0
         self.world_step, self.launches = 0, np.zeros((len(STRATEGIES), len(AMOUNTS), 2), np.int64)   # this world's
         self.gvec = np.zeros(8, np.float32)
@@ -223,8 +228,11 @@ class Trainer:
     # --- one sub-step
     def after_step(self, env, res, ep: dict) -> None:
         """Turn the step's outcome into transitions, labelled source txs and health counts."""
+        observe = getattr(env.launderer_policy, "observe", None)      # an option policy chains its own decisions
         for tr in res.transitions:
-            if tr.role in self.learn:
+            if tr.role == "launderer" and observe is not None:
+                observe(tr.agent, self.step_no, tr.reward, tr.noop)
+            if tr.role in self.learn and not (self.oppo and tr.role == "launderer"):
                 L = self.roles[tr.role]
                 L.buf.set(L.tail[tr.agent], [tr.action.get(b, 0) for b in L.branches],
                           [b in tr.realized for b in L.branches], tr.reward)
@@ -289,7 +297,7 @@ class Trainer:
     def update(self, losses: dict) -> None:
         """One gradient step per learning role (after its warm-up)."""
         for name, L in self.roles.items():
-            if name not in self.learn:
+            if name not in self.learn or (self.oppo and name == "launderer"):
                 continue
             t0 = time.perf_counter()
             v = L.update(self.replay_rng)
@@ -315,6 +323,8 @@ class Trainer:
         self.det.pool.begin(env.graph, env_seed, params.mask_rate)
         self.last = {}
         self.world_step, self.launches = self.step_no, np.zeros((len(STRATEGIES), len(AMOUNTS), 2), np.int64)
+        if self.oppo:                                    # the first worlds launch on a schedule (curriculum, §10)
+            self.policies[0].begin_world(scheduled=w < CURRICULUM_WORLDS)
         losses, tot = defaultdict(list), defaultdict(float)
         u0, ratio, t_world = self.det.n_updates, [], time.perf_counter()
         for e in range(EPISODES):
@@ -344,7 +354,13 @@ class Trainer:
                 tot[k] += v
         # world end: terminal transitions, then detector-W on the pruned export (§10)
         for name, L in self.roles.items():
-            if name in self.learn:
+            if self.oppo and name == "launderer":         # every decision chain closes, then the world's update
+                ro = self.policies[0].finish(self.step_no)
+                if name in self.learn:
+                    t0 = time.perf_counter()
+                    L.learn(ro)
+                    self.sec["update_launderer"] += time.perf_counter() - t0
+            elif name in self.learn:
                 L.end_world()
         sim = None
         if "detector" in self.learn:
@@ -386,11 +402,11 @@ class Trainer:
             "launderer": {"decisions": {k[2:]: int(v) for k, v in tot.items() if k.startswith("l_")},
                           "launches": self.launches.tolist()},
             "learner": {name: L.pop_stats() for name, L in self.roles.items() if name in self.learn},
-            "replay": {name: L.buf.support() for name, L in self.roles.items() if name in self.learn},
+            "replay": {name: L.buf.support() for name, L in self.roles.items() if name in self.learn and hasattr(L, "buf")},
             "updates": {"launderer": self.roles["launderer"].n_updates, "innocent": self.roles["innocent"].n_updates,
                         "detector_t": self.det.n_updates, "detector_w": self.det.n_w_updates},
-            "buffer": {"launderer": self.roles["launderer"].buf.ready, "innocent": self.roles["innocent"].buf.ready,
-                       "flag": self.det.flag_buf.ready, "pool": self.det.pool.n},
+            "buffer": {name: L.buf.ready for name, L in self.roles.items() if hasattr(L, "buf")}
+                      | {"flag": self.det.flag_buf.ready, "pool": self.det.pool.n},
             "sec": {"world": time.perf_counter() - t_world, **{k: round(v, 2) for k, v in self.sec.items()}},
         }
         self.sec.clear()
@@ -407,15 +423,17 @@ class Trainer:
                 f.write(json.dumps(rec) + "\n")
 
     def _models(self) -> dict:
-        D = self.det
-        return {"launderer": self.roles["launderer"].net, "launderer_targ": self.roles["launderer"].targ,
-                "innocent": self.roles["innocent"].net, "innocent_targ": self.roles["innocent"].targ,
+        D, L = self.det, self.roles["launderer"]
+        lm = ({"launderer_actor": L.actor, "launderer_critic": L.critic} if self.oppo
+              else {"launderer": L.net, "launderer_targ": L.targ})
+        return lm | {"innocent": self.roles["innocent"].net, "innocent_targ": self.roles["innocent"].targ,
                 "det_t": D.det_t, "det_w": D.det_w, "gq": D.gq, "gq_targ": D.gq_targ}
 
     def load_models(self, path: Path, roles) -> None:
         """Load the networks of ``roles`` (and their target networks) from a checkpoint's ``models``: another run's
         trained opponents, for a frozen-opponent diagnostic. Optimizers and buffers are left alone."""
-        keys = {"launderer": ("launderer", "launderer_targ"), "innocent": ("innocent", "innocent_targ"),
+        keys = {"launderer": ("launderer_actor", "launderer_critic") if self.oppo else ("launderer", "launderer_targ"),
+                "innocent": ("innocent", "innocent_targ"),
                 "detector": ("det_t", "det_w", "gq", "gq_targ")}
         ck = torch.load(path, map_location=self.device, weights_only=False)
         mods = self._models()
@@ -424,8 +442,9 @@ class Trainer:
                 mods[k].load_state_dict(ck["models"][k])
 
     def _opts(self) -> dict:
-        return {"launderer": self.roles["launderer"].opt, "innocent": self.roles["innocent"].opt,
-                "det_t": self.det.opt_t, "det_w": self.det.opt_w}
+        L = self.roles["launderer"]
+        lo = {"launderer_actor": L.opt_a, "launderer_critic": L.opt_c} if self.oppo else {"launderer": L.opt}
+        return lo | {"innocent": self.roles["innocent"].opt, "det_t": self.det.opt_t, "det_w": self.det.opt_w}
 
     def save(self, path: Path, full: bool = True) -> None:
         """``full``: everything a resume needs. Otherwise the models only (the transfer checkpoints)."""
@@ -434,14 +453,18 @@ class Trainer:
         if full:
             D = self.det
             ck |= {"opts": {k: o.state_dict() for k, o in self._opts().items()},
-                   "buffers": {"launderer": self.roles["launderer"].buf, "innocent": self.roles["innocent"].buf,
-                               "flag": D.flag_buf, "global": D.gbuf, "pool": D.pool},
+                   "buffers": {name: L.buf for name, L in self.roles.items() if hasattr(L, "buf")}
+                              | {"flag": D.flag_buf, "global": D.gbuf, "pool": D.pool},
                    "counters": {"step_no": self.step_no, "n_updates": D.n_updates, "n_w_updates": D.n_w_updates,
                                 "launderer": self.roles["launderer"].n_updates,
                                 "innocent": self.roles["innocent"].n_updates},
                    "epochs": self.epochs, "rng": self.rng.bit_generator.state,
                    "rng_replay": self.replay_rng.bit_generator.state, "rng_cpu": torch.get_rng_state(),
                    "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
+            if self.oppo:                                # saved at a world boundary: no decision is pending
+                pol = self.policies[0]
+                ck["oppo"] = {"rng": pol.rng.bit_generator.state, "sched": pol.sched_rng.bit_generator.state,
+                             "mb": self.roles["launderer"].mb_rng.bit_generator.state}
         tmp = path.with_suffix(".tmp")
         torch.save(ck, tmp, pickle_protocol=5)
         os.replace(tmp, path)       # never leave a half-written checkpoint
@@ -455,7 +478,13 @@ class Trainer:
         for k, o in self._opts().items():
             o.load_state_dict(ck["opts"][k])
         b, c, D = ck["buffers"], ck["counters"], self.det
-        self.roles["launderer"].buf, self.roles["innocent"].buf = b["launderer"], b["innocent"]
+        for name, L in self.roles.items():
+            if hasattr(L, "buf"):
+                L.buf = b[name]
+        if self.oppo:
+            pol = self.policies[0]
+            pol.rng.bit_generator.state, pol.sched_rng.bit_generator.state = ck["oppo"]["rng"], ck["oppo"]["sched"]
+            self.roles["launderer"].mb_rng.bit_generator.state = ck["oppo"]["mb"]
         D.flag_buf, D.gbuf, D.pool = b["flag"], b["global"], b["pool"]
         self.world, self.step_no, self.epochs = ck["world"], c["step_no"], ck["epochs"]
         D.n_updates, D.n_w_updates = c["n_updates"], c["n_w_updates"]

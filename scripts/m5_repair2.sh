@@ -8,6 +8,7 @@
 # After a selection:  scripts/m5_repair2.sh confirm [JOBS=2]   (seeds 1 and 2, the confirmation worlds, the verdict)
 # Stage 1 (hns.marl.stage1): scripts/m5_repair2.sh stage1 CELL OPP   (one run and its reading, 25-minute GPU cap;
 #   the blocks before PLR1 had 45 minutes)
+# OPPO-MC (hns.marl.oppo_block): scripts/m5_repair2.sh oppo OPP   (one block: train and read, 45-minute cap)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 LOGS=runs/repair2/logs
@@ -28,6 +29,12 @@ if [ "${1:-}" = stage1 ]; then          # one block, one attempt: train, then re
   timeout 1500 uv run python -m hns.marl.stage1 run --cell "$2" --opp "$3" >> "$LOGS/stage1_$2_$3.log" 2>&1
   rc=$?
   [ $rc -eq 0 ] || echo "stage 1 $2 $3: exit $rc (124 = cut by the 25-minute cap); the block is incomplete and is not run again"
+  exit $rc
+fi
+if [ "${1:-}" = oppo ]; then           # OPPO-MC (hns.marl.oppo_block): one block, one attempt, 45-minute cap
+  timeout 2700 uv run python -m hns.marl.oppo_block run --opp "$2" >> "$LOGS/oppo_$2.log" 2>&1
+  rc=$?
+  [ $rc -eq 0 ] || echo "OPPO-MC $2: exit $rc (124 = cut by the 45-minute cap); the block is incomplete and is not run again"
   exit $rc
 fi
 if [ "${1:-}" = confirm ]; then
