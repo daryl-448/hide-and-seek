@@ -178,6 +178,18 @@ NDA-1 first. A numerical failure (criterion 1) is reported first and decides nei
 here before it runs. If it fails too, the next step is the user's decision; a structural change of the learner
 (one launch-timing decision per episode, or an actor-critic) would depart from SPEC's Algorithm 1.
 
+**Outcome of ``PLR1``'s block** (2026-11-12, 17.5 minutes; runs/repair2/PLR1_full0_s0/stage1.json and
+stage1_diag.json). Not promising against Full-0: criteria 2, 3 and 4 fail. World-30 utility +0.01 (bar +0.402;
+``PL`` +0.23, paired difference -0.23, interval -0.42 to -0.03), reward -0.03, ``Q`` below the return by 0.63
+(tolerance 0.5). World 20 was +0.34, so a policy formed and was lost (all four differences negative, mean -0.34).
+At world 20 it launched almost everything (held 0.01, 91 % of launches ``direct``); at world 30 it holds 0.46
+(``direct50`` 0.09), 32 % of its launches are ``direct``, the inspector catches 58 % of its cash-outs, 27 % of the
+proceeds are frozen, and the network prefers ``direct`` at 3 %, 24 % and 3 % of idle states by band. On its own
+world-30 buffer its root errors are larger than ``PL``'s, also for rich launches (5.8 against 3.9), so the expected
+mechanism did not appear. Its held share is ``PL``'s 0.563 minus more than 0.10 (by 0.006, within four-world
+noise), and what changed is the strategy its launches use: by the agreed rule the next block is ``PL`` with
+independent value streams, NDA-1 first.
+
 Usage::
 
     python -m hns.marl.stage1 offline --opp full0        (and nda1)
