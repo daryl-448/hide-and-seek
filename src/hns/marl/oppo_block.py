@@ -136,6 +136,24 @@ the failing criteria are reported with their numbers, nothing is re-run, and a n
 evaluation cut or aborted (or one that left no record) leaves its opponent incomplete, not passed; the other
 opponent is still read, and the script exits non-zero.
 
+**Confirmation reading (2026-11-13, A30, ``runs/repair2/oppo_confirmation.json``): not confirmed.** Every step
+completed (0 failed).
+
+- Full-0, **confirmed** (6 of 6): U +.486 (seeds .507, .517, .435; direct50 .659), R +.460; vs wait +.486 [+.437,
+  +.535]; critic bias -.06, .00, +.14 (tolerance .5); held - direct50 -.029; matched +.620, vs uniform +1.48
+  [+1.43, +1.53], vs initial +1.44 [+1.37, +1.51]; retention +.247 [+.221, +.274].
+- NDA-1, **not confirmed**: criterion 4 fails, held - direct50 +.246 [+.227, +.266] (bar .05). The other five hold:
+  U +.361 (seeds .520, .085, .479; direct50 .569), R +.317; vs wait +.361 [+.294, +.429]; critic bias -.46, -.27,
+  +.04; matched +.424, vs uniform +1.34 [+1.27, +1.42], vs initial +1.32 [+1.22, +1.43]; retention +.313. The failure
+  is seed 1: held .89 at world 30 (seeds 0 and 2: .04, .08). In training, every seed held .6-.9 around worlds 15-21
+  as the actor's entropy fell. Seeds 0 and 2 recovered by about world 24 (entropy back to about 3); seed 1's entropy
+  kept falling (1.2 to .7) and it held .8-.97 through world 30.
+- Initial-actor check: identical across seeds in every world but one (Full-0 world 202, seed 2: -.837 against
+  -.822). Re-evaluated alone in fresh processes, all three seeds give -.82204. The code path is seed-independent;
+  the difference came from the run (six processes on one GPU, or state carried between evaluations in a process).
+
+As declared, nothing is re-run; a new declaration follows.
+
 Usage::
 
     scripts/m5_repair2.sh oppo full0       (oppo_block run: train, then read; the 45-minute cap)
