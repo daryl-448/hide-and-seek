@@ -94,10 +94,53 @@ reported; route outcomes per exposed BTC are not logged. The reading's world-20 
 matched and argmax ones all count inside the block's cap. The live game's per-world acting copies and NMAI's
 static option launderers are not implemented yet: neither is used by these blocks.
 
+**Confirmation (declared 2026-11-12, after both development blocks read promising and before any confirmation run;
+SPEC §10, step 2).** Both blocks were promising (``OPPO_full0_s0/oppo.json``, ``OPPO_nda1_s0/oppo.json``).
+
+- Training: the unchanged design above, the amended trust control included, with launderer seeds 1 and 2 against
+  each frozen opponent: four new runs (``train --opp O --seed S``), each one attempt with its seed's multiverse
+  draws. Seed 0 is the development block's run. Seeds 1 and 2 run on a JarvisLabs A30 (seed 0 ran on the local GTX
+  1650 SUPER) from the same code; every process has a 2-hour timeout, and a run cut by it is incomplete.
+- Evaluation (``confirm-eval --opp O --seed S``, all six runs) on the eight confirmation worlds 200-207
+  (``EVAL_SALT``; no cycle has used them): natural, the world-20 and world-30 snapshots; matched, the world-30
+  snapshot and the untrained initial actor (the world-0 snapshot; its probability tables are exactly uniform, so
+  every seed's initial actor plays the same game in a world, which is reported as a check); argmax, the world-30
+  snapshot (reported). References: repair2's scripted ``wait``, ``uniform``, ``direct50`` and ``repeat50`` on
+  worlds 200-207, computed for this confirmation (``python -m hns.marl.repair2 refs --opp O --worlds confirmation``).
+  Every run is evaluated on the references' graph-view stream (``eval_views``; seed 0's development records are
+  unchanged by it), so a world is the same game for every seed and for the references; only the launderer differs.
+
+Per opponent, with ``u_sj``, ``r_sj``, ``h_sj`` seed ``s``'s world-30 natural BTC utility, reward and held share in
+world ``j``, ``X_j`` the mean over the three seeds, and every interval a two-sided 95 % t-interval over the eight
+worlds, the opponent is **confirmed** if all six hold:
+
+1. sound: all three runs completed 30 worlds as in the block's criterion 1, and every evaluation world completed
+   (no abort; each decision chain's return reproduced);
+2. calibrated values, for each seed separately (SPEC acceptance item 2): ``|mean_j b_sj| <= max(0.5, 0.25 mean_j
+   a_sj)`` over its world-30 natural rollouts;
+3. natural economics: ``mean_j U_j > 0`` and ``mean_j u_sj > 0`` for at least 2 of the 3 seeds; ``mean U`` at least
+   half of ``direct50``'s mean utility and ``mean R`` at least half of its mean reward; ``U_j - wait_j`` and
+   ``R_j - wait_j`` with lower bounds above 0;
+4. utilization: ``mean_j (H_j - direct50's held_j) <= 0.05``;
+5. matched skill: with ``M_j`` the seeds' mean matched utility and ``I_j`` the initial actor's, ``M - uniform`` and
+   ``M - I`` each have a mean of at least 0.02 and a lower bound above 0, and ``mean_j (matched_sj - uniform_j) >= 0``
+   for at least 2 of the 3 seeds;
+6. retention: ``mean_s (u_sj - world-20 u_sj)`` has a lower bound above -0.05 (each seed against its own world-20
+   snapshot).
+
+Not gated: legacy A's floor (it was for the development comparison only); the differences to ``direct50`` and
+``repeat50``; every seed's numbers; the argmax policy; where the proceeds went; the critic's strata; launches by mode.
+
+**What follows**: both opponents confirmed -> the live pilot (SPEC §10, step 3), declared before it runs. Otherwise
+the failing criteria are reported with their numbers, nothing is re-run, and a new declaration follows. A run or
+evaluation cut or aborted (or one that left no record) leaves its opponent incomplete, not passed; the other
+opponent is still read, and the script exits non-zero.
+
 Usage::
 
     scripts/m5_repair2.sh oppo full0       (oppo_block run: train, then read; the 45-minute cap)
     python -m hns.marl.oppo_block read --opp full0     (only after a harness fault in the reading)
+    scripts/m5_oppo_confirm.sh             (on the A30: the confirmation's training, references, evaluation, reading)
 """
 
 from __future__ import annotations
@@ -106,7 +149,8 @@ import argparse
 import json
 import shutil
 import time
-from dataclasses import asdict
+from contextlib import contextmanager
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -120,6 +164,7 @@ from hns.marl.capability import _t95
 from hns.marl.oppo import OptionPolicy, calibration, decision_summary
 
 WORLDS, DEV_WORLDS, SNAPS = 30, (100, 101, 102, 103), (20, 30)
+CONF_WORLDS, SEEDS = tuple(r2.PANELS["confirmation"]), (0, 1, 2)    # the confirmation (module docstring)
 RATIO_TOL = 1e-3
 ACCT_MAX, A_SLACK, RETAIN, HELD_SLACK, SKILL_MIN = 1e-6, 0.02, 0.05, 0.05, 0.02
 ABORTS = (FloatingPointError, RuntimeError, ValueError)     # numerical, chain and legality faults (and out of memory)
@@ -153,23 +198,36 @@ def load_snapshot(tr: mt.Trainer, path: Path) -> None:
 def evaluate(tr: mt.Trainer, mode: str, worlds) -> list[dict]:
     """The loaded actor on held-out ``worlds`` against ``tr``'s frozen opponents. ``mode``: ``natural``,
     ``matched`` (the references' launch schedule) or ``argmax``. Each record adds the critic's calibration and
-    what the launderers decided."""
+    what the launderers decided. Every seed plays on the references' graph-view stream (``eval_views``)."""
     out = []
-    for j in worlds:
-        pol = OptionPolicy(tr, tr.roles["launderer"], np.random.default_rng([cap.EVAL_SALT, j, 4]),
-                           np.random.default_rng([cap.EVAL_SALT, j, 3]), greedy=mode == "argmax",
-                           scheduled=mode == "matched")
-        t0 = time.perf_counter()
-        r = r2.play(tr, pol, j)
-        ro = pol.finish(tr.step_no)
-        G = ro.returns()
-        ro.check(G)
-        r |= {"cal": calibration(ro.rows, G), "options": decision_summary(ro.rows, G) | {"waits": pol.waits.tolist()}}
-        out.append(r)
-        print(f"  eval {mode} world {j}: nL {r['n_launderers']} reward {r['reward']:+.3f} utility {r['btc_utility']:+.3f} "
-              f"held {r['held_frac']:.3f} tranches {r['tranches']:.2f} V-G {r['cal'].get('bias', float('nan')):+.2f} "
-              f"{time.perf_counter() - t0:.0f}s", flush=True)
+    with eval_views(tr):
+        for j in worlds:
+            pol = OptionPolicy(tr, tr.roles["launderer"], np.random.default_rng([cap.EVAL_SALT, j, 4]),
+                               np.random.default_rng([cap.EVAL_SALT, j, 3]), greedy=mode == "argmax",
+                               scheduled=mode == "matched")
+            t0 = time.perf_counter()
+            r = r2.play(tr, pol, j)
+            ro = pol.finish(tr.step_no)
+            G = ro.returns()
+            ro.check(G)
+            r |= {"cal": calibration(ro.rows, G), "options": decision_summary(ro.rows, G) | {"waits": pol.waits.tolist()}}
+            out.append(r)
+            print(f"  eval {mode} world {j}: nL {r['n_launderers']} reward {r['reward']:+.3f} "
+                  f"utility {r['btc_utility']:+.3f} held {r['held_frac']:.3f} tranches {r['tranches']:.2f} "
+                  f"V-G {r['cal'].get('bias', float('nan')):+.2f} {time.perf_counter() - t0:.0f}s", flush=True)
     return out
+
+
+@contextmanager
+def eval_views(tr: mt.Trainer):
+    """Evaluation samples every role's graph views from the references' stream (``cap.make``'s seed), so a world is
+    the same game for every launderer seed; only the configuration's seed is swapped, and only for ``view_seed`` (no
+    other evaluation path reads it). Training keeps its seed's stream. Seed 0's records are unchanged."""
+    cfg, tr.cfg = tr.cfg, replace(tr.cfg, seed=cap.SEED)
+    try:
+        yield
+    finally:
+        tr.cfg = cfg
 
 
 # ---------------------------------------------------------------------------- the reading
@@ -357,20 +415,170 @@ def read(a) -> dict:
     return reading
 
 
-def cmd_run(a) -> None:
-    """One block, one attempt: train, then read. The marker written first makes a second start refuse."""
-    smoke = a.worlds != WORLDS or a.eval_worlds is not None
+def _start(a, smoke: bool) -> tuple[Path, dict]:
+    """One attempt: the marker written first makes a second start refuse."""
     mark = mark_path(a.opp, a.seed) if not smoke else r2.RUNS / "smoke" / f"oppo_{a.opp}_s{a.seed}.json"
     if mark.exists() and not smoke:
-        raise SystemExit(f"{mark}: this block was already attempted ({json.loads(mark.read_text())['state']}); "
+        raise SystemExit(f"{mark}: this run was already attempted ({json.loads(mark.read_text())['state']}); "
                          "it is not run again")
     mark.parent.mkdir(parents=True, exist_ok=True)
     info = {"opp": a.opp, "seed": a.seed, "started": time.strftime("%Y-%m-%d %H:%M:%S"), "state": "started"}
     mark.write_text(json.dumps(info, indent=1))
+    return mark, info
+
+
+def cmd_run(a) -> None:
+    """One block, one attempt: train, then read."""
+    smoke = a.worlds != WORLDS or a.eval_worlds is not None
+    mark, info = _start(a, smoke)
     train(a)
     reading = read(a)
     mark.write_text(json.dumps(info | {"state": "done", "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
                                        "promising": reading["promising"]}, indent=1))
+
+
+def cmd_train(a) -> None:
+    """A confirmation seed's run, one attempt: training only (``confirm-eval`` reads it)."""
+    smoke = a.worlds != WORLDS
+    if a.seed == 0 and not smoke:
+        raise SystemExit("seed 0 is the development block's run")
+    mark, info = _start(a, smoke)
+    res = train(a)
+    mark.write_text(json.dumps(info | {"state": f"trained: {res['status']}",
+                                       "finished": time.strftime("%Y-%m-%d %H:%M:%S")}, indent=1))
+
+
+# ---------------------------------------------------------------------------- the confirmation
+def cmd_confirm_eval(a) -> None:
+    """One run on the confirmation worlds: natural world 20 and 30, matched world 30 and the initial actor, argmax
+    world 30 (module docstring). A smoke run reads its first and last snapshot in place of worlds 20 and 30."""
+    smoke = a.worlds != WORLDS or a.eval_worlds is not None
+    out = run_dir(a.opp, a.seed, smoke)
+    f = out / "confirm.json"
+    if f.exists():
+        raise SystemExit(f"{f}: this run was already evaluated")
+    res = json.loads((out / "result.json").read_text())
+    worlds = CONF_WORLDS[:a.eval_worlds]
+    w20, w30 = SNAPS if a.worlds == WORLDS else (0, a.worlds)
+    rec = {"opp": a.opp, "seed": a.seed, "worlds": list(worlds), "status": res["status"], "git_sha": mt.git_sha()}
+    if res["status"] == "ok":
+        tr = make(a.opp, a.seed, torch.device(a.device))
+        try:
+            for key, w, mode in (("natural_20", w20, "natural"), ("natural_30", w30, "natural"),
+                                 ("matched", w30, "matched"), ("initial", 0, "matched")):
+                load_snapshot(tr, out / "snap" / f"w{w:02d}.pt")
+                rec[key] = evaluate(tr, mode, worlds)
+        except ABORTS as e:
+            rec["status"] = f"aborted in the evaluation: {type(e).__name__}: {e}"
+        if rec["status"] == "ok":                                          # reported only
+            try:
+                load_snapshot(tr, out / "snap" / f"w{w30:02d}.pt")
+                rec["argmax"] = evaluate(tr, "argmax", worlds)
+            except ABORTS:
+                rec["argmax"] = None
+    f.write_text(json.dumps(rec, indent=1))
+
+
+def _load(f: Path) -> dict:
+    """A run's record; a run that left none (cut by its timeout, or crashed) is incomplete."""
+    return json.loads(f.read_text()) if f.exists() else {"status": f"incomplete: no {f}"}
+
+
+def _by_world(rows: list[dict], worlds) -> list[dict]:
+    by = {r["world"]: r for r in rows}
+    return [by[j] for j in worlds]
+
+
+def read_confirmation(results: dict, evals: dict, refs: dict, worlds) -> dict:
+    """The six criteria for one opponent (module docstring). ``results`` / ``evals``: seed -> ``result.json`` /
+    ``confirm.json`` (``_load``: a missing file is an incomplete record); ``refs``: the scripted policies' records on
+    ``worlds``, or ``None`` if any is missing. Anything not ok leaves the opponent incomplete, never read."""
+    seeds = sorted(evals)
+    bad = [f"seed {s} {k}: {x['status']}" for s in seeds for k, x in (("training", results[s]), ("evaluation", evals[s]))
+           if x["status"] != "ok"] + (["references: incomplete"] if refs is None else [])
+    if bad:
+        return {"status": "; ".join(bad), **{f"c{i}": False for i in range(1, 7)}, "confirmed": False}
+    col = lambda rows, k: r2._col(_by_world(rows, worlds), k)                     # noqa: E731
+    m = lambda key, k: np.stack([col(evals[s][key], k) for s in seeds])          # noqa: E731  (seed, world)
+    U, R, H, U20 = m("natural_30", "btc_utility"), m("natural_30", "reward"), m("natural_30", "held_frac"), \
+        m("natural_20", "btc_utility")
+    M, M0 = m("matched", "btc_utility"), m("initial", "btc_utility")
+    ref = {p: {k: col(refs[p], k) for k in ("btc_utility", "reward", "held_frac")} for p in refs}
+    d50, wait, unif = ref["direct50"], ref["wait"], ref["uniform"]
+    c1 = all(results[s]["worlds_done"] == WORLDS and results[s]["accounting_gap_max"] <= ACCT_MAX
+             and results[s]["ratio_dev_max"] is not None and results[s]["ratio_dev_max"] <= RATIO_TOL for s in seeds)
+    critic = {}
+    for s in seeds:
+        cal = [r["cal"] for r in _by_world(evals[s]["natural_30"], worlds)]
+        b, g = float(np.mean([c["bias"] for c in cal])), float(np.mean([c["g_abs"] for c in cal]))
+        critic[s] = {"bias": b, "g_abs": g, "tolerance": max(0.5, 0.25 * g), "ok": abs(b) <= max(0.5, 0.25 * g)}
+    c2 = all(c["ok"] for c in critic.values())
+    u, r = U.mean(0), R.mean(0)
+    vs_wait_u, vs_wait_r = _t95(u - wait["btc_utility"]), _t95(r - wait["reward"])
+    c3 = bool(u.mean() > 0 and (U.mean(1) > 0).sum() >= 2 and u.mean() >= 0.5 * d50["btc_utility"].mean()
+              and r.mean() >= 0.5 * d50["reward"].mean() and vs_wait_u[1] > 0 and vs_wait_r[1] > 0)
+    held = H.mean(0) - d50["held_frac"]
+    c4 = bool(held.mean() <= HELD_SLACK)
+    sk_u, sk_i = _t95(M.mean(0) - unif["btc_utility"]), _t95(M.mean(0) - M0.mean(0))
+    seed_skill = (M - unif["btc_utility"]).mean(1)
+    c5 = bool(sk_u[0] >= SKILL_MIN and sk_u[1] > 0 and sk_i[0] >= SKILL_MIN and sk_i[1] > 0 and (seed_skill >= 0).sum() >= 2)
+    keep = _t95((U - U20).mean(0))
+    c6 = bool(keep[1] > -RETAIN)
+    out = {"status": "ok", "c1": bool(c1), "c2": c2, "c3": c3, "c4": c4, "c5": c5, "c6": c6,
+           "utility": float(u.mean()), "reward": float(r.mean()), "utility_by_seed": dict(zip(seeds, U.mean(1).tolist())),
+           "direct50": {"utility": float(d50["btc_utility"].mean()), "reward": float(d50["reward"].mean()),
+                        "held": float(d50["held_frac"].mean())},
+           "vs_wait": {"utility": list(vs_wait_u), "reward": list(vs_wait_r)},
+           "critic_by_seed": critic, "held_over_direct50": list(_t95(held)),
+           "matched": {"utility": float(M.mean()), "uniform": float(unif["btc_utility"].mean()),
+                       "initial": float(M0.mean()), "vs_uniform": list(sk_u), "vs_initial": list(sk_i),
+                       "vs_uniform_by_seed": dict(zip(seeds, seed_skill.tolist())),
+                       "initial_seed_spread": float(np.abs(M0 - M0[0]).max())},
+           "retention": list(keep)}
+    return out | {"confirmed": all(out[f"c{i}"] for i in range(1, 7))}
+
+
+def confirmation_reported(evals: dict, refs: dict, worlds) -> dict:
+    """Not gated: differences to direct50 and repeat50, the argmax policy, proceeds, critic strata, launch modes."""
+    seeds = sorted(evals)
+    col = lambda rows, k: r2._col(_by_world(rows, worlds), k)                     # noqa: E731
+    u = np.mean([col(evals[s]["natural_30"], "btc_utility") for s in seeds], 0)
+    rw = np.mean([col(evals[s]["natural_30"], "reward") for s in seeds], 0)
+    out = {"vs": {p: {"utility": list(_t95(u - col(refs[p], "btc_utility"))),
+                      "reward": list(_t95(rw - col(refs[p], "reward")))} for p in ("direct50", "repeat50")}}
+    out["argmax_by_seed"] = {s: (float(col(evals[s]["argmax"], "btc_utility").mean()) if evals[s].get("argmax") else None)
+                             for s in seeds}
+    out["proceeds"] = {k: float(np.mean([col(evals[s]["natural_30"], k) for s in seeds]))
+                       for k in ("success_frac", "frozen_frac", "fee_frac", "held_frac", "tranches", "detection_rate")}
+    strata: dict = {}
+    for s in seeds:
+        for r in evals[s]["natural_30"]:
+            for k, v in r["cal"].get("strata", {}).items():
+                x = strata.setdefault(k, [0, 0.0])
+                x[0], x[1] = x[0] + v["n"], x[1] + v["bias"] * v["n"]
+    out["critic_strata"] = {k: {"n": n, "bias": b / n} for k, (n, b) in sorted(strata.items())}
+    out["launches_by_mode"] = np.sum([r["options"]["launches"] for s in seeds for r in evals[s]["natural_30"]], 0).tolist()
+    return out
+
+
+def cmd_confirm(a) -> None:
+    """The confirmation's reading for both opponents (module docstring)."""
+    smoke = a.worlds != WORLDS or a.eval_worlds is not None
+    worlds = CONF_WORLDS[:a.eval_worlds]
+    out = {"worlds": list(worlds), "opponents": {}}
+    for opp in r2.OPPS:
+        results = {s: _load(run_dir(opp, s, smoke) / "result.json") for s in SEEDS}
+        evals = {s: _load(run_dir(opp, s, smoke) / "confirm.json") for s in SEEDS}
+        files = {p: r2.ref_path(opp, "confirmation", p, smoke) for p in r2.REFS}
+        refs = ({p: [r for r in json.loads(f.read_text())["eval"] if r["world"] in worlds] for p, f in files.items()}
+                if all(f.exists() for f in files.values()) else None)
+        verdict = read_confirmation(results, evals, refs, worlds)
+        rep = confirmation_reported(evals, refs, worlds) if verdict["status"] == "ok" else None
+        out["opponents"][opp] = {"reading": verdict, "reported": rep}
+    out["confirmed"] = all(o["reading"]["confirmed"] for o in out["opponents"].values())
+    f = (r2.RUNS / "smoke" if smoke else r2.RUNS) / "oppo_confirmation.json"
+    f.write_text(json.dumps(out, indent=1))
+    print(json.dumps(out, indent=1))
 
 
 def cmd_read(a) -> None:
@@ -384,15 +592,18 @@ def cmd_read(a) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("run", "read"):
+    cmds = {"run": cmd_run, "read": cmd_read, "train": cmd_train, "confirm-eval": cmd_confirm_eval,
+            "confirm": cmd_confirm}
+    for name in cmds:
         p = sub.add_parser(name)
-        p.add_argument("--opp", choices=list(r2.OPPS), required=True)
-        p.add_argument("--seed", type=int, default=0)
-        p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+        if name != "confirm":
+            p.add_argument("--opp", choices=list(r2.OPPS), required=True)
+            p.add_argument("--seed", type=int, default=0)
+            p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
         p.add_argument("--worlds", type=int, default=WORLDS, help="anything else is a smoke run")
         p.add_argument("--eval-worlds", type=int, help="a smoke run's evaluation worlds")
     a = ap.parse_args(argv)
-    {"run": cmd_run, "read": cmd_read}[a.cmd](a)
+    cmds[a.cmd](a)
     return 0
 
 
