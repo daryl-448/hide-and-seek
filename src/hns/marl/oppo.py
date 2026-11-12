@@ -17,10 +17,13 @@ On-policy PPO over the launderer's options, with complete-world Monte Carlo retu
 - :class:`OppoLearner` holds the actor and the critic (no shared parameters) and updates once per world, after
   every chain is closed: the critic ``V = m v`` (``m`` the wealth scale of ``hns.marl.learner``) on
   ``0.5 (v - G / m)^2``; the actor on the clipped surrogate of the complete action's probability ratio with the
-  advantage ``G - V`` divided by the world's RMS advantage, plus 0.01 times the joint entropy. Four passes each,
-  minibatch 128 (micro-batched), Adam 3e-4, clip norm 1.0. After each actor pass the joint, launch-conditional
-  and duration-conditional KL from the old policy are measured over the world's decisions; above 0.02 nats the
-  pass is undone, its Adam state included, and the actor stops for that world.
+  advantage ``G - V`` divided by the world's RMS advantage, plus 0.01 times the joint entropy. Four passes each
+  (the actor's up to four), minibatch 128 (micro-batched), Adam 3e-4, clip norm 1.0. After every actor Adam step
+  the joint, launch-conditional and duration-conditional KL from the actor that collected the world are measured
+  over the world's decisions; above 0.02 nats that step is undone, its Adam state included, the steps before it
+  are kept, and the actor stops for that world (amended 2026-11-12 before the first block: the guard was per pass,
+  CONSULT6.md). The ratio quantiles, clip fraction, entropy and gradient norms in the statistics cover every
+  attempted step, an undone one included.
 
 Before any update, the stored log-probabilities are recomputed from the stored observations (``ratio_dev_max``,
 the largest difference: the probability ratios start at one) and so are the values (``value_dev_max``).
@@ -241,7 +244,7 @@ class OppoLearner:
         self.opt_a = torch.optim.Adam(self.actor.parameters(), lr=LR)
         self.opt_c = torch.optim.Adam(self.critic.parameters(), lr=LR)
         self.mb_rng = np.random.default_rng([cfg.seed, 13])                 # minibatch order, its own stream
-        self.n_updates = 0                                                   # actor optimizer steps
+        self.n_updates = 0                                                   # attempted actor optimizer steps
         self.stats: dict = {}
 
     # --- forward passes
@@ -341,12 +344,14 @@ class OppoLearner:
         adv = A / s_a
         dev = self.device
         lp_old_t, adv_t = _t(lp_old.astype(np.float32), dev), _t(adv.astype(np.float32), dev)
-        # actor: up to EPOCHS passes, each undone (with its Adam state) if the KL guard trips
-        kls, accepted, rejected, ratios, clipped, ents, gnorm = [], 0, 0, [], 0, [], []
+        # actor: up to EPOCHS passes; the KL guard after every Adam step undoes the step that crosses it (its Adam
+        # state included), keeps the steps before it, and stops the actor for this world
+        kls, accepted, rejected, passes, ratios, clipped, ents, gnorm = [], 0, 0, 0, [], 0, [], []
+        stop = False
         for _ in range(EPOCHS):
-            snap = (copy.deepcopy(self.actor.state_dict()), copy.deepcopy(self.opt_a.state_dict()))
-            self.actor.train()
             for mb in self._chunks(self.mb_rng.permutation(n), MINIBATCH):
+                snap = (copy.deepcopy(self.actor.state_dict()), copy.deepcopy(self.opt_a.state_dict()))
+                self.actor.train()
                 self.opt_a.zero_grad(set_to_none=True)
                 for idx in self._chunks(mb, MICRO):
                     ob, masks, act, gf = self._batch(rows, idx)
@@ -369,14 +374,17 @@ class OppoLearner:
                 gnorm.append(g)
                 self.opt_a.step()
                 self.n_updates += 1
-            kl = self._kl(rows, old)
-            kls.append(kl)
-            if max(kl) > KL_MAX:
-                self.actor.load_state_dict(snap[0])
-                self.opt_a.load_state_dict(snap[1])
-                rejected += 1
+                kl = self._kl(rows, old)                    # against the actor that collected the world
+                kls.append(kl)
+                if max(kl) > KL_MAX:
+                    self.actor.load_state_dict(snap[0])
+                    self.opt_a.load_state_dict(snap[1])
+                    rejected, stop = 1, True
+                    break
+                accepted += 1
+            if stop:
                 break
-            accepted += 1
+            passes += 1
         # critic: EPOCHS passes on 0.5 (v - G / m)^2
         y = _t((G / m).astype(np.float32), dev)
         closs, cgnorm = [], []
@@ -399,8 +407,11 @@ class OppoLearner:
                 closs.append(tot)
                 self.opt_c.step()
         r = np.concatenate(ratios) if ratios else np.ones(1)
+        masks = np.stack([x.masks for x in rows])
+        support = [n, int(masks[:, P.SLICES["gate"]][:, P.LAUNCH].sum()), int((masks[:, P.SLICES["dur"]].sum(1) > 1).sum())]
         st |= {"adv_scale": s_a, "return_mean": float(G.mean()), "value_bias": float((v_old - G).mean()),
-               "epochs_accepted": accepted, "epochs_rejected": rejected, "kl": kls,
+               "steps_accepted": accepted, "steps_rejected": rejected, "passes_complete": passes,
+               "kl": kls, "kl_final": list(kls[accepted - 1]) if accepted else [0.0, 0.0, 0.0], "kl_support": support,
                "ratio_q": np.quantile(r, [0.01, 0.5, 0.99]).tolist(), "clip_frac": clipped / max(len(r), 1),
                "entropy": float(np.concatenate(ents).mean()) if ents else None,
                "grad_actor": float(np.mean(gnorm)) if gnorm else None, "grad_actor_max": max(gnorm, default=None),

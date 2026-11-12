@@ -19,6 +19,20 @@ options-first curriculum, worlds 6-30 the natural actor (SPEC §10). The reward,
 the opponents are unchanged. Snapshots of the actor, critic, optimizers and random streams: before training, every
 two worlds, and every world from 15; the complete decision rollout of worlds 15 and 30.
 
+**Actor trust control (amended 2026-11-12 after the timing smoke, before either development block; the sixth Sol
+consult, runs/sol_consult/CONSULT6.md).** In every training world, including the curriculum, the actor takes at
+most four shuffled passes without replacement, logical minibatch 128, Adam lr 3e-4 and gradient-norm clip 1.0.
+After each tentative actor Adam step, compute exact mean old-to-new joint KL over every collected decision,
+conditional launch KL over every launch-feasible collected decision including sampled waits, and conditional
+duration KL over every collected decision with more than one feasible duration. All three compare with the fixed
+actor that collected this world, never with the preceding minibatch's actor. If any mean exceeds 0.02 nats, undo
+only that step, restoring its immediately preceding actor parameters and complete Adam state, including moment
+tensors and step counters; retain all earlier accepted steps and stop actor updates for this world. Do not retry the
+rejected step or add passes. Non-finite quantities still abort the block. The critic completes its four scheduled
+passes. No other learner, curriculum, block-budget or reading condition changes. (Why: a 7-world GPU timing smoke,
+not a block, showed the per-pass guard undoing the first pass of every natural world, so the actor never changed
+once timing was released; the choice used training-update mechanics only, no evaluation world.)
+
 **A block is one attempt**: one opponent, training and reading together, under a 45-minute cap on the local GPU
 (``scripts/m5_repair2.sh oppo OPP``). ``run`` records that it started and refuses to start again; a block cut by the
 cap, or aborted, is incomplete, never promising. ``read`` exists only to finish the reading of a block whose training
@@ -59,8 +73,9 @@ The block is **promising** if all five hold:
 Reported, not gated: every paired difference with its 95 % t-interval over the four worlds (to wait, ``direct50``,
 ``repeat50``, PL's world-30 network, retention, held, skill); where the proceeds went; launches by mode, wait
 durations, launch rates by balance band and world time, launch no-ops; the critic's bias pooled, BTC-weighted, by
-band and time, its RMSE and explained variance; per training world, the actor passes kept and undone, the three
-KLs, entropy, clip fraction, ratio quantiles and gradient norms; the argmax policy.
+band and time, its RMSE and explained variance; per training world, complete and partial actor passes, actor Adam
+steps accepted and rejected, the three KLs after every attempted step and at the retained final actor, and the
+conditional-support counts, entropy, clip fraction, ratio quantiles and gradient norms; the argmax policy.
 
 **What follows** (the consult's D3, fixed now): both blocks promising -> confirmation with seeds 1 and 2 on unused
 worlds (SPEC §10), not the six runs. Natural economics or held funds fail while matched skill passes -> inspect the
@@ -241,16 +256,17 @@ def reported(snaps: dict, refs: dict, opp: str, argmax: list[dict] | None) -> di
 
 
 def training_summary(out: Path) -> dict:
-    """Per training world, from ``metrics.jsonl``: the actor passes kept and undone, the KLs and the learner's
-    other statistics, and the world's economics."""
+    """Per training world, from ``metrics.jsonl``: the actor steps kept and undone, complete passes, the KLs and the
+    learner's other statistics, and the world's economics."""
     rows = []
     for _, e in mt.read_records(out / "metrics.jsonl"):
         if e["kind"] != "epoch":
             continue
         st = e["learner"].get("launderer", {})
         rows.append({"world": e["world"] + 1, "utility": e["btc_utility"], "held": e["held_frac"],
-                     **{k: st.get(k) for k in ("n", "epochs_accepted", "epochs_rejected", "kl", "entropy", "clip_frac",
-                                               "ratio_q", "adv_scale", "value_bias", "grad_actor", "grad_critic",
+                     **{k: st.get(k) for k in ("n", "steps_accepted", "steps_rejected", "passes_complete", "kl",
+                                               "kl_final", "kl_support", "entropy", "clip_frac", "ratio_q",
+                                               "adv_scale", "value_bias", "grad_actor", "grad_critic",
                                                "ratio_dev_max")}})
     return {"worlds": rows}
 
@@ -279,11 +295,12 @@ def train(a) -> dict:
             if w in (15, 30):
                 torch.save(tr.policies[0].rollout, out / "snap" / f"rollout_w{w:02d}.pt", pickle_protocol=5)
             st = r["learner"]["launderer"]
-            kl = max((max(k) for k in st.get("kl", [])), default=float("nan"))
+            kl = max(st.get("kl_final") or [float("nan")])
             print(f"{out.name} world {w}/{a.worlds} | R_L {r['reward']['launderer']:+.3f} utility {r['btc_utility']:+.3f} "
                   f"held {r['held_frac']:.2f} det {r['detection_rate']:.2f} tranches {r['tranches']} "
-                  f"direct {r['strategy_share']['direct']:.2f} | decisions {st.get('n')} passes "
-                  f"{st.get('epochs_accepted')}+{st.get('epochs_rejected')} kl {kl:.4f} H {st.get('entropy') or float('nan'):.2f} "
+                  f"direct {r['strategy_share']['direct']:.2f} | decisions {st.get('n')} steps "
+                  f"{st.get('steps_accepted')}+{st.get('steps_rejected')} passes {st.get('passes_complete')} kl {kl:.4f} "
+                  f"H {st.get('entropy') or float('nan'):.2f} "
                   f"| {r['sec']['world']:.0f}s, {(time.perf_counter() - t0) / 60:.1f} min", flush=True)
     except ABORTS as e:
         status = f"aborted: {type(e).__name__}: {e}"

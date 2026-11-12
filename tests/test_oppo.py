@@ -302,35 +302,133 @@ def test_options_curriculum_then_natural_decisions(tmp_path, monkeypatch):
             else:                                                # idle without a decision: only while waiting
                 assert until.get(i, -1) > step and init == E_WAIT
     st2 = rec2["learner"]["launderer"]
-    assert st2["ratio_dev_max"] < 1e-5 and st2["epochs_accepted"] + st2["epochs_rejected"] >= 1
+    assert st2["ratio_dev_max"] < 1e-5 and st2["steps_accepted"] + st2["steps_rejected"] >= 1
     assert abs(rec2["accounting_gap"]) < 1e-9 and all(math.isfinite(v) for v in rec2["losses"].values())
     assert rec2["updates"]["launderer"] > rec1["updates"]["launderer"] and "launderer" not in rec2["buffer"]
 
 
-def test_kl_guard_undoes_the_pass_and_its_optimizer_state(tmp_path, monkeypatch):
+@pytest.fixture
+def guard_world(tmp_path, monkeypatch):
+    """A natural world's closed rollout, collected by the current actor, with several logical minibatches per pass
+    (``MINIBATCH`` 4), and a learner whose Adam state is not empty. ``restore()`` returns the learner to the state
+    in which the rollout was collected."""
+    monkeypatch.setattr(oppo, "MINIBATCH", 4)
+    monkeypatch.setattr(oppo, "MICRO", 2)
     tr = _trainer(tmp_path, monkeypatch, episodes=6, curriculum=0)
     L = tr.roles["launderer"]
-    monkeypatch.setattr(oppo, "KL_MAX", 1e9)                     # nothing is undone
-    st = tr.run_world()["learner"]["launderer"]
-    assert st["n"] > 0 and st["epochs_accepted"] == oppo.EPOCHS and len(st["kl"]) == oppo.EPOCHS
-    assert L.opt_a.state_dict()["state"]
-    real, seen = L.learn, {}
+    real, got = L.learn, []
+    L.learn = got.append                                          # the trainer hands each world's rollout over
+    tr.run_world()
+    real(got[0])                                                  # one real update: Adam has moments and counters
+    tr.run_world()
+    L.learn = real
+    ro, state0 = got[1], copy.deepcopy(L.state())
+    assert len(ro.rows) >= 3 * oppo.MINIBATCH and L.opt_a.state_dict()["state"]
 
-    def learn(ro):
-        seen["actor"] = copy.deepcopy(L.actor.state_dict())
-        seen["opt"] = copy.deepcopy(L.opt_a.state_dict())
-        seen["critic"] = copy.deepcopy(L.critic.state_dict())
-        return real(ro)
+    def restore():
+        L.load_state(copy.deepcopy(state0))
 
-    L.learn = learn
-    monkeypatch.setattr(oppo, "KL_MAX", -1.0)                    # every pass trips the guard
-    st = tr.run_world()["learner"]["launderer"]
-    assert st["n"] > 0 and st["epochs_rejected"] == 1 and st["epochs_accepted"] == 0 and len(st["kl"]) == 1
-    assert all(torch.equal(v, L.actor.state_dict()[k]) for k, v in seen["actor"].items())
+    steps = {"critic": 0}
+    step_c = L.opt_c.step
+
+    def count(*a, **k):
+        steps["critic"] += 1
+        return step_c(*a, **k)
+
+    monkeypatch.setattr(L.opt_c, "step", count)
+    return tr, L, ro, state0, restore, steps
+
+
+def _scripted_kl(L, monkeypatch, seq):
+    """Replace the KL measurement by a script: the k-th call (after the k-th Adam step) returns ``seq[k-1]`` (zeros
+    after the script) and records the actor and Adam state at that moment, i.e. just before step k + 1."""
+    calls, after = [], {}
+
+    def kl(rows, old):
+        calls.append(old)
+        after[len(calls)] = (copy.deepcopy(L.actor.state_dict()), copy.deepcopy(L.opt_a.state_dict()))
+        return seq[len(calls) - 1] if len(calls) <= len(seq) else (0.0, 0.0, 0.0)
+
+    monkeypatch.setattr(L, "_kl", kl)
+    return calls, after
+
+
+def _same(L, actor: dict, opt: dict) -> bool:
     now = L.opt_a.state_dict()["state"]
-    assert now.keys() == seen["opt"]["state"].keys()
-    assert all(torch.equal(now[k][x], seen["opt"]["state"][k][x]) for k in now for x in ("step", "exp_avg", "exp_avg_sq"))
-    assert any(not torch.equal(v, L.critic.state_dict()[k]) for k, v in seen["critic"].items())  # the critic trains on
+    return (all(torch.equal(v, L.actor.state_dict()[k]) for k, v in actor.items()) and now.keys() == opt["state"].keys()
+            and all(torch.equal(now[k][x], opt["state"][k][x]) for k in now for x in ("step", "exp_avg", "exp_avg_sq")))
+
+
+def test_kl_guard_undoes_only_the_crossing_step(guard_world, monkeypatch):
+    tr, L, ro, state0, restore, steps = guard_world
+    n = len(ro.rows)
+    p = -(-n // oppo.MINIBATCH)                                   # Adam steps in one pass
+    ok = (0.001, 0.001, 0.0)
+    cases = {                                                     # script -> (accepted, complete passes)
+        "step 2 crosses (joint)": ([ok, (0.5, 0.0, 0.0)], 1, 0),
+        "step 1 crosses (launch)": ([(0.0, 0.5, 0.0)], 0, 0),
+        "a later pass crosses (duration)": ([ok] * (p + 1) + [(0.0, 0.0, 0.5)], p + 1, 1),
+        "nothing crosses": ([], oppo.EPOCHS * p, oppo.EPOCHS),
+    }
+    for name, (seq, acc, passes) in cases.items():
+        restore()
+        steps["critic"], u0 = 0, L.n_updates
+        calls, after = _scripted_kl(L, monkeypatch, seq)
+        st = L.learn(ro)
+        rej = int(acc < oppo.EPOCHS * p)
+        assert (st["steps_accepted"], st["steps_rejected"], st["passes_complete"]) == (acc, rej, passes), name
+        assert L.n_updates - u0 == acc + rej == len(st["kl"]) == len(calls), name     # no retry, no further step
+        assert all(c is calls[0] for c in calls), name            # always against the actor that collected the world
+        assert steps["critic"] == oppo.EPOCHS * p, name           # the critic completes its four passes
+        if acc == 0:
+            assert _same(L, state0["actor"], state0["opt_a"]), name
+        else:                                                     # the state just before the crossing step, not before the world
+            assert _same(L, *after[acc]) and not _same(L, state0["actor"], state0["opt_a"]), name
+        assert st["kl_final"] == (list(seq[acc - 1]) if 0 < acc <= len(seq) else [0.0, 0.0, 0.0]), name
+
+
+def test_kl_guard_measures_the_whole_world_against_the_collecting_actor(guard_world, monkeypatch):
+    tr, L, ro, state0, restore, steps = guard_world
+    m = np.stack([r.masks for r in ro.rows])
+    support = [len(ro.rows), int(m[:, P.SLICES["gate"]][:, P.LAUNCH].sum()), int((m[:, P.SLICES["dur"]].sum(1) > 1).sum())]
+    assert support[2] < support[0]                                # rows with a single feasible duration exist
+    assert any(r.action[0] == P.WAIT and r.masks[P.SLICES["gate"]][P.LAUNCH] for r in ro.rows)  # sampled waits count
+    seen = []
+    real_kl = L._kl
+
+    def kl(rows, old):
+        seen.append(len(rows))
+        return real_kl(rows, old)
+
+    monkeypatch.setattr(L, "_kl", kl)
+    restore()
+    monkeypatch.setattr(oppo, "KL_MAX", 1e9)
+    free = L.learn(ro)
+    assert free["kl_support"] == support and set(seen) == {len(ro.rows)}
+    k1, k2 = max(free["kl"][0]), max(free["kl"][1])
+    assert 0 < k1 < k2                                            # drift from the collecting actor accumulates
+    restore()
+    monkeypatch.setattr(oppo, "KL_MAX", (k1 + k2) / 2)            # the real KL: step 1 fits, step 2 does not
+    st = L.learn(ro)
+    assert (st["steps_accepted"], st["steps_rejected"]) == (1, 1)
+    assert np.allclose(st["kl"][1], free["kl"][1], atol=1e-6)     # measured from the same reference as before
+
+
+def test_a_partial_pass_survives_save_and_load_and_non_finite_still_aborts(guard_world, monkeypatch, tmp_path):
+    tr, L, ro, state0, restore, steps = guard_world
+    restore()
+    _scripted_kl(L, monkeypatch, [(0.001, 0.0, 0.0)] * 2 + [(1.0, 0.0, 0.0)])
+    st = L.learn(ro)
+    assert (st["steps_accepted"], st["passes_complete"]) == (2, 0)
+    tr.save(tmp_path / "partial.pt")
+    other = _trainer(tmp_path, monkeypatch, episodes=6, curriculum=0, out_name="other")
+    other.load(tmp_path / "partial.pt")
+    assert _same(other.roles["launderer"], L.actor.state_dict(), L.opt_a.state_dict())
+    restore()
+    with torch.no_grad():
+        next(L.actor.parameters()).fill_(float("nan"))
+    with pytest.raises(FloatingPointError):
+        L.learn(ro)
 
 
 def test_oppo_resume_replays_the_killed_world_exactly(tmp_path, monkeypatch):
