@@ -518,8 +518,9 @@ _NOISE = np.array([0.01, -0.01, 0.02, -0.02, 0.0, 0.01, -0.01, 0.0])
 
 
 def _conf_refs(W):
-    return {"direct50": _conf_rows(0.6, W, held=0.08), "uniform": _conf_rows(-0.8 + _NOISE, W),
-            "wait": _conf_rows(_NOISE, W), "repeat50": _conf_rows(0.65, W)}
+    z = np.resize(_NOISE, len(W))
+    return {"direct50": _conf_rows(0.6, W, held=0.08), "uniform": _conf_rows(-0.8 + z, W),
+            "wait": _conf_rows(z, W), "repeat50": _conf_rows(0.65, W)}
 
 
 def _conf_res(worlds=30):
@@ -527,9 +528,10 @@ def _conf_res(worlds=30):
 
 
 def _conf_ev(W, u30=0.5, u20=0.3, matched=0.5, initial=-0.8, held=0.06, bias=0.1, status="ok", snaps=(20, 30)):
-    return {"status": status, f"natural_{snaps[1]}": _conf_rows(u30 + _NOISE, W, held=held, bias=bias),
-            f"natural_{snaps[0]}": _conf_rows(u20 + _NOISE, W), "matched": _conf_rows(matched + _NOISE, W),
-            "initial": _conf_rows(initial + _NOISE, W)}
+    z = np.resize(_NOISE, len(W))
+    return {"status": status, f"natural_{snaps[1]}": _conf_rows(u30 + z, W, held=held, bias=bias),
+            f"natural_{snaps[0]}": _conf_rows(u20 + z, W), "matched": _conf_rows(matched + z, W),
+            "initial": _conf_rows(initial + z, W)}
 
 
 def test_confirmation_reading_has_six_criteria():
@@ -703,3 +705,182 @@ def test_block_report_compares_with_pl_at_its_world_30_for_any_endpoint(tmp_path
     refs = {p: rows(0.4) for p in ("wait", "direct50", "repeat50")}
     rep = ob.reported({40: rows(0.3), 60: rows(0.5)}, refs, "full0", None)
     assert math.isclose(rep["vs"]["PL_w30"]["utility"][0], 0.3)
+
+
+# ---------------------------------------------------------------------------- OPPO-MC-60R (the third attempt)
+def test_attempt_60r_is_a_confirmation_on_sixteen_unused_worlds():
+    import hns.marl.repair2 as r2
+    from hns.marl import oppo_block as ob
+
+    a30, a60, a = ob.ATTEMPTS["30"], ob.ATTEMPTS["60"], ob.ATTEMPTS["60r"]
+    assert (a.worlds, a.snaps, a.dev_seed, a.seeds, a.rollouts) == (60, (40, 60), None, (6, 7, 8), a60.rollouts)
+    assert a.conf_worlds == tuple(range(224, 240))
+    assert ob.run_dir(a, "nda1", 7) == r2.RUNS / "OPPO60R_nda1_s7"
+    assert ob.mark_path(a, "full0", 6, smoke=True) == r2.RUNS / "smoke" / "oppo60r_full0_s6.json"
+    pilot = set(range(216, 224)) | set(range(240, 248))                 # kept for the live pilot (SPEC §10)
+    used = (set(ob.DEV_WORLDS) | set(r2.PANELS["selection"]) | set(a30.conf_worlds) | set(a60.conf_worlds)
+            | set(r2.TIMELINE_WORLDS) | set(r2.PANEL_WORLDS) | pilot)
+    assert not used & set(a.conf_worlds) and not set(a.seeds) & (set(a30.seeds) | set(a60.seeds))
+    assert a.retain == RETAIN_60R and (a30.retain, a60.retain) == (0.05, 0.05)   # the closed attempts keep their margin
+
+
+RETAIN_60R = 0.15                                                       # the declared margin (oppo_block's docstring)
+
+
+@pytest.mark.parametrize("argv", [
+    ["run", "--attempt", "60r", "--opp", "full0", "--seed", "6"],         # no development block
+    ["read", "--attempt", "60r", "--opp", "full0", "--seed", "6"],        # so no development reading either
+    ["train", "--attempt", "60r", "--opp", "nda1"],                       # no default seed
+    ["train", "--attempt", "60r", "--opp", "nda1", "--seed", "3"],        # attempt 60's seed
+    ["confirm-eval", "--attempt", "60r", "--opp", "full0", "--seed", "5"],
+])
+def test_attempt_60r_refuses_what_it_did_not_declare(argv, tmp_path, monkeypatch):
+    import hns.marl.repair2 as r2
+    from hns.marl import oppo_block as ob
+
+    monkeypatch.setattr(r2, "RUNS", tmp_path)
+    with pytest.raises(SystemExit, match="seed"):
+        ob.main(argv)
+    assert not list(tmp_path.iterdir())
+
+
+def test_attempt_60r_has_no_development_reading_of_a_confirmation_run(tmp_path, monkeypatch):
+    import hns.marl.repair2 as r2
+    from hns.marl import oppo_block as ob
+
+    monkeypatch.setattr(r2, "RUNS", tmp_path)
+    d = ob.run_dir(ob.ATTEMPTS["60r"], "full0", 6)                       # a trained confirmation run, no oppo.json
+    d.mkdir(parents=True)
+    (d / "result.json").write_text(json.dumps(_conf_res(60)))
+    with pytest.raises(SystemExit, match="no development block"):
+        ob.main(["read", "--attempt", "60r", "--opp", "full0", "--seed", "6"])
+    assert sorted(f.name for f in d.iterdir()) == ["result.json"]
+
+
+def test_confirmation_reading_of_attempt_60r_uses_its_margin_and_worlds():
+    from hns.marl import oppo_block as ob
+
+    att, a60 = ob.ATTEMPTS["60r"], ob.ATTEMPTS["60"]
+    W = att.conf_worlds
+    refs, res = _conf_refs(W), {s: _conf_res(60) for s in att.seeds}
+    ev = lambda **kw: {s: _conf_ev(W, snaps=att.snaps, **kw) for s in att.seeds}   # noqa: E731
+    inside, outside = att.retain - 0.03, att.retain + 0.03
+    r = ob.read_confirmation(res, ev(u20=0.5 + inside), refs, W, att)
+    assert r["confirmed"] and r["retention_margin"] == att.retain and math.isclose(r["retention"][0], -inside)
+    x = ob.read_confirmation(res, ev(u20=0.5 + outside), refs, W, att)
+    assert not x["c6"] and all(x[f"c{i}"] for i in range(1, 6))
+    # the same loss fails attempt 60's margin: the closed attempt is read as it was declared
+    W60 = a60.conf_worlds
+    y = ob.read_confirmation({s: _conf_res(60) for s in a60.seeds},
+                             {s: _conf_ev(W60, snaps=a60.snaps, u20=0.5 + inside) for s in a60.seeds},
+                             _conf_refs(W60), W60, a60)
+    assert not y["c6"] and y["retention_margin"] == 0.05
+    # a loss with noise across the sixteen worlds: the lower bound decides, not the mean
+    noisy = ev()
+    for s in att.seeds:
+        for j, row in enumerate(noisy[s]["natural_40"]):
+            row["btc_utility"] = 0.5 + att.retain - 0.01 + (0.2 if j % 2 else -0.2)
+    z = ob.read_confirmation(res, noisy, refs, W, att)
+    assert z["retention"][0] > -att.retain > z["retention"][1] and not z["c6"]
+
+
+def test_confirmation_report_adds_retention_by_seed_and_in_discounted_reward():
+    from hns.marl import oppo_block as ob
+
+    att = ob.ATTEMPTS["60r"]
+    W = att.conf_worlds
+    evals = {}
+    for k, s in enumerate(att.seeds):
+        e = _conf_ev(W, snaps=att.snaps, u20=0.5 + 0.02 * k)
+        for key, disc in (("natural_40", 1.5), ("natural_60", 1.7 + 0.1 * k)):
+            for row in e[key]:
+                row |= {"reward_discounted": disc, "success_frac": 0.7, "frozen_frac": 0.2, "fee_frac": 0.0,
+                        "tranches": 5.0, "detection_rate": 0.1, "options": {"launches": [0] * 36}}
+        e |= {"argmax": None, "state_use": {"60": {"n": 3}}, "actor_steps": 100 + k}
+        evals[s] = e
+    rep = ob.confirmation_reported(evals, _conf_refs(W), W, att)
+    assert rep["retention_by_seed"] == pytest.approx({6: 0.0, 7: -0.02, 8: -0.04})
+    assert rep["retention_discounted"][0] == pytest.approx(0.3)                      # +0.2, +0.3, +0.4
+    assert rep["retention_discounted_by_seed"] == pytest.approx({6: 0.2, 7: 0.3, 8: 0.4})
+    assert rep["state_use"][7] == {"60": {"n": 3}} and rep["actor_steps"] == {6: 100, 7: 101, 8: 102}
+
+
+def test_state_use_measures_what_replacing_the_state_changes(guard_world):
+    from hns.marl import oppo_block as ob
+
+    _, L, ro, _, restore, _ = guard_world
+    rows = ro.rows
+    ob_ = collate([r.obs for r in rows])
+    masks = np.stack([r.masks for r in rows])
+    feas = masks[:, P.SLICES["gate"]][:, P.LAUNCH]
+    assert feas.any() and np.ptp(ob_.x_c, axis=0).max() > 0
+    with torch.no_grad():                                               # a gate that reads its body
+        L.actor.gate.weight.copy_(torch.randn(L.actor.gate.weight.shape, generator=torch.Generator().manual_seed(3)))
+    u = ob.state_use(L, rows)
+    assert u["n"] == int(feas.sum()) and u["p_launch"][0] <= u["p_launch"][1] <= u["p_launch"][2]
+    assert sum(u["band_n"].values()) == u["n"] and not L.actor.trunk.norm._forward_hooks
+    with torch.no_grad():
+        p = L._forward(ob_, masks)["gate"].exp()[:, P.LAUNCH].numpy()
+        flat = replace(ob_, x_c=np.broadcast_to(ob_.x_c.mean(0), ob_.x_c.shape).copy())
+        p_c = L._forward(flat, masks)["gate"].exp()[:, P.LAUNCH].numpy()
+        g, f = ob_.tensors(L.device)
+        h = L.actor.trunk(g, f["x_tx"], f["x_w"], f["x_c"]).clone()
+        d = L.actor.trunk.enc.out_dim
+        h[:, :d] = h[:, :d].mean(0, keepdim=True)
+        p_g = torch.softmax(L.actor.gate(L.actor.gate_body(h)), 1)[:, P.LAUNCH].numpy()
+    assert u["dp_launch"]["controller"] == pytest.approx(np.abs(p - p_c)[feas].mean(), rel=1e-4, abs=1e-7)
+    assert u["dp_launch"]["graph"] == pytest.approx(np.abs(p - p_g)[feas].mean(), rel=1e-4, abs=1e-7)
+    assert u["p_launch"] == pytest.approx(np.quantile(p[feas], [0.05, 0.5, 0.95]), abs=1e-6)
+    assert u["dp_launch"]["controller"] > 0 or u["dp_launch"]["graph"] > 0
+    small = ob.state_use(L, rows, chunk=3)                              # the means are over every row, not a chunk
+    assert small["dp_launch"] == pytest.approx(u["dp_launch"], rel=1e-3, abs=1e-6)
+    assert small["mode_tv"] == pytest.approx(u["mode_tv"], rel=1e-3, abs=1e-6)
+    with torch.no_grad():                                               # a policy of biases alone reads no state
+        for m in (L.actor.gate, L.actor.mode):
+            m.weight.zero_()
+        L.actor.gate.bias.copy_(torch.tensor([0.0, 1.0]))
+    blind = ob.state_use(L, rows)
+    assert blind["p_launch"] == pytest.approx([1 / (1 + math.exp(-1.0))] * 3, abs=1e-6)
+    assert max(*blind["dp_launch"].values(), *blind["mode_tv"].values()) < 1e-6
+    restore()
+
+
+def test_retention_power_matches_a_simulation():
+    from scipy import stats
+
+    from hns.marl import oppo_block as ob
+
+    rng = np.random.default_rng(0)
+    for true, sd, n, margin in ((0.0, 0.063, 8, 0.05), (-0.036, 0.077, 16, 0.10), (-0.07, 0.07, 16, 0.10)):
+        x = rng.normal(true, sd, (40000, n))
+        low = x.mean(1) - stats.t.ppf(0.975, n - 1) * x.std(1, ddof=1) / math.sqrt(n)
+        assert ob.retention_power(true, sd, n, margin) == pytest.approx((low > -margin).mean(), abs=0.01)
+    assert ob.retention_power(-0.10, 0.07, 16, 0.10) == pytest.approx(0.025, abs=1e-6)   # at the margin: the test's size
+    assert ob.retention_power(0.0, 0.063, 8, 0.05) < 0.5 < ob.retention_power(0.0, 0.063, 16, 0.10)
+
+
+def test_bootstrap_power_reads_a_recorded_attempt_under_the_new_rules(tmp_path, monkeypatch):
+    import hns.marl.repair2 as r2
+    from hns.marl import oppo_block as ob
+
+    monkeypatch.setattr(r2, "RUNS", tmp_path)
+    src, att = ob.ATTEMPTS["60"], ob.ATTEMPTS["60r"]
+    W = src.conf_worlds
+    loss = {"full0": att.retain - 0.03, "nda1": att.retain + 0.03}      # inside the new margin, and outside it
+    for opp in r2.OPPS:
+        for s in src.seeds:
+            d = ob.run_dir(src, opp, s)
+            d.mkdir(parents=True)
+            (d / "result.json").write_text(json.dumps(_conf_res(60)))
+            (d / "confirm.json").write_text(json.dumps(_conf_ev(W, snaps=src.snaps, u20=0.5 + loss[opp])))
+        for p, rows in _conf_refs(W).items():
+            r2.ref_path(opp, src.panel, p).write_text(json.dumps({"eval": rows}))
+    out = ob.bootstrap_power(src, att, draws=40)
+    assert out["full0"] == {**{f"c{i}": 1.0 for i in range(1, 7)}, "confirmed": 1.0}
+    assert out["nda1"]["c6"] == 0.0 and out["nda1"]["confirmed"] == 0.0 and out["nda1"]["c5"] == 1.0
+    same = ob.bootstrap_power(src, src, draws=40)                       # under the old margin both losses fail
+    assert same["full0"]["c6"] == 0.0 and same["full0"]["c4"] == 1.0
+    (ob.run_dir(src, "nda1", 4) / "confirm.json").unlink()              # an incomplete record gives no estimate
+    assert ob.bootstrap_power(src, att, draws=5)["nda1"] is None
+    with pytest.raises(SystemExit, match="budget"):
+        ob.bootstrap_power(ob.ATTEMPTS["30"], att, draws=5)

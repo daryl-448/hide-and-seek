@@ -240,6 +240,79 @@ attempt 60; NDA-1 failed attempt 30 and passed attempt 60. Runs of different att
 opponent's learner is chosen separately, so the live pilot is not permitted. Nothing is re-run; a new declaration
 follows (the user's call).
 
+**Third attempt: OPPO-MC-60R (declared 2026-11-13 and approved by the user, before any of it ran).** Attempts 30 and
+60 stay as read: no verdict is amended, no old run is read again, and no run of one attempt is pooled with another's.
+
+*What a review of attempt 60's records found* (2026-11-13, CPU only, nothing re-run):
+
+- Criterion 6 as declared (a lower 95 % bound above -.05 over eight worlds) passes a learner that has lost nothing
+  49 % of the time at Full-0's noise (the seeds' mean difference has a world-to-world standard deviation of .063) and
+  36 % at NDA-1's (.077): ``retention_power``. No declaration had checked that.
+- By seed, world 60 minus world 40 on worlds 208-215 is -.011, +.008, -.106 (Full-0) and -.066, -.076, +.209 (NDA-1).
+  NDA-1 passed criterion 6 only because seed 5 was still recovering at world 40. Four of the five runs that had
+  converged by world 40 are lower at world 60; the ten-world training means are flat.
+- The actor's choices barely depend on the state (a torchlens inspection of all twelve runs,
+  ``runs/inspect_m5/oppo_lens.py``): one launch probability, one mode mix and one wait mix serve every decision.
+  Between worlds 40 and 60 that launch probability rose in all six runs (.63-.83 to .78-.94), with shorter waits and
+  more launches per episode. The small loss after world 40 is therefore probably a drift of that setting and not only
+  noise.
+
+*What changes, and what does not.* The learner, its 60-world budget, the curriculum, the three KL checks, the
+simulator, the observations and the frozen opponents are attempt 60's, unchanged. The attempt changes the seeds, the
+evaluation worlds and criterion 6:
+
+- Runs: fresh launderer seeds 6, 7 and 8 against both opponents, 60 worlds each (``train --attempt 60r``), one
+  attempt each with its seed's multiverse draws, on a JarvisLabs A30, the six runs and the two reference jobs at
+  once under CUDA MPS (attempt 60's confirmation ran four and two), a two-hour timeout per process. There is no
+  development block: the learner is attempt 60's, whose development readings stand as read (NDA-1 promising, Full-0
+  not), and ``run`` refuses this attempt.
+- Evaluation: seeds 6, 7 and 8 on the sixteen unused worlds 224-239 (``r2.PANELS["confirmation60r"]``; 216-223 and
+  240-247 are kept for the live pilot), on the references' view stream: natural at worlds 40 and 60, matched at world
+  60 and the initial actor, argmax at world 60 (reported). The scripted references are computed on 224-239 before any
+  learner evaluation. Each run's evaluation is its own fresh process, one at a time.
+- Reading: the six criteria of the confirmation above, with 60 in place of 30 and 40 in place of 20, every interval a
+  two-sided 95 % t-interval over the sixteen worlds. Criteria 1 to 5 and their tolerances are unchanged (utilization:
+  the mean held excess over ``direct50`` at most .05, over all three seeds). **Criterion 6 is amended**: the lower
+  bound of ``mean_s (u_sj - world-40 u_sj)`` must be above **-.15** (``Attempt.retain``).
+
+*The amendment is made after a failure.* Attempt 60's Full-0 failed the old criterion 6, and this margin was chosen
+knowing that, so a pass here is weaker evidence than a pass of a test fixed in advance; the report says so. The
+user first approved -.10 over sixteen worlds. Before any run, resampling attempt 60's records by world and by seed
+(all six runs, per opponent) showed that -.10 would pass both opponents 58 % of the time: the five runs that had
+converged by world 40 lose .050 on average after it (all six, with NDA-1 seed 5's +.209, average -.007). The user
+then chose -.15 over sixteen worlds (the alternatives shown were -.10 over sixteen, and -.125
+over thirty-two). The margin is set by what the test has to catch: the Q-learners' losses were .25 to .43.
+
+*Power, stated before the runs* (SPEC §16; ``python -m hns.marl.oppo_block power --attempt 60r --source 60``):
+
+- Criterion 6 alone, at a world-to-world standard deviation of .063 / .077: it passes a true difference of 0 or
+  -.05 in 100 % of runs, -.07 in 99.7 % / 97 %, -.10 in 84 % / 68 %, -.15 in 2.5 % (its size), -.25 in none.
+- All six criteria, resampling attempt 60's own records by world and by seed (20,000 draws): Full-0 96.9 %, NDA-1
+  97.4 %, about 94 % for both; criteria 1 to 5 pass in every draw. This knows only what seeds 3-5 did. A seed still
+  holding its funds at world 60 would fail criterion 4, and has probability zero here; one of the six NDA-1 seeds of
+  both attempts still held .89 at world 30, and none of the three did at world 60.
+
+*Reported, not gated:* everything the confirmation above reports, and: criterion 6's difference for each seed, and
+in discounted reward (the quantity the launderer is trained on) with its interval; each run's kept actor steps; and
+**state use** (``state_use``) at the world-40 and world-60 snapshots, over the run's saved decisions of training
+worlds 40 and 60 at which a launch is feasible: the launch probability's 5 %, 50 % and 95 % quantiles and its mean
+by balance band, and the mean change of the launch probability and of the mode distribution (total variation) when
+every use of the controller features, or the whole graph readout, is replaced by its mean. On attempt 60's runs it
+reproduces the inspection's numbers.
+
+*Records:* ``OPPO60R_{opp}_s{seed}``, markers ``oppo60r_{opp}_s{seed}.json``, references
+``ref_{opp}_confirmation60r_*``, the reading ``oppo60r_confirmation.json``; the script is ``scripts/m5_oppo60r.sh``.
+Nothing of attempts 30 or 60 is read or overwritten.
+
+**What follows** (fixed now): both opponents confirmed -> the live pilot (SPEC §10, step 3: 60 fresh worlds per arm,
+a world-30 fork, worlds 216-223 and 240-247), declared in full before it runs. Held funds or natural economics fail
+while matched skill passes -> the timing-coverage package declared for attempt 60 (a smooth launch floor of 0.10 and
+waits of 1 or 5 sub-steps), not more worlds. Retention fails -> it was not shown that the learner keeps its utility
+within the margin after world 40 (a real loss, or too little precision); the launch probability's drift is read
+first (state use at 40 and 60), and the next declaration changes the learner, not the margin and not the endpoint. Matched skill fails -> audit likelihoods, masks and
+credit. Only the critic fails -> the critic is revised, not its tolerance. An incomplete or numerically failed step
+is never a pass; only the user may void an attempt for an established harness fault.
+
 Usage::
 
     scripts/m5_repair2.sh oppo full0       (attempt 30: oppo_block run, train then read; the 45-minute cap)
@@ -247,12 +320,15 @@ Usage::
     scripts/m5_oppo_confirm.sh             (attempt 30, on the A30: the confirmation)
     scripts/m5_oppo60.sh [smoke]           (attempt 60, on the A30: both development blocks, then the confirmation)
     scripts/m5_oppo60.sh confirm           (attempt 60: the confirmation only; the deviation above)
+    scripts/m5_oppo60r.sh [smoke]          (attempt 60R, on the A30: six runs, their evaluations, the reading)
+    python -m hns.marl.oppo_block power --attempt 60r --source 60      (a declaration's power lines; CPU)
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
 import time
 from contextlib import contextmanager
@@ -267,7 +343,9 @@ import hns.marl.capability as cap
 import hns.marl.repair2 as r2
 import hns.marl.train as mt
 from hns.marl.capability import _t95
-from hns.marl.oppo import OptionPolicy, calibration, decision_summary
+from hns.marl.obs import collate
+from hns.marl.oppo import BANDS, OptionPolicy, calibration, decision_summary
+from hns.models import policy as P
 from hns.sim.world import EPISODES
 
 DEV_WORLDS = (100, 101, 102, 103)
@@ -283,10 +361,11 @@ class Attempt:
     name: str                   # run directories ``{name}_{opp}_s{seed}``; markers and the reading in lower case
     worlds: int                 # training worlds per run
     snaps: tuple[int, int]      # the retention reference and the eligible endpoint
-    dev_seed: int               # the development blocks' launderer seed (also a confirmation seed)
+    dev_seed: int | None        # the development blocks' launderer seed (also a confirmation seed); None: no block
     seeds: tuple[int, ...]      # the confirmation's seeds
     panel: str                  # ``r2.PANELS`` key of the confirmation worlds
     rollouts: tuple[int, ...]   # training worlds whose complete decision rollout is saved
+    retain: float = RETAIN      # the confirmation's retention margin (criterion 6)
 
     @property
     def conf_worlds(self) -> tuple[int, ...]:
@@ -294,7 +373,8 @@ class Attempt:
 
 
 ATTEMPTS = {"30": Attempt("OPPO", 30, (20, 30), 0, (0, 1, 2), "confirmation", (15, 30)),          # closed 2026-11-13
-            "60": Attempt("OPPO60", 60, (40, 60), 3, (3, 4, 5), "confirmation60", (15, 30, 40, 60))}
+            "60": Attempt("OPPO60", 60, (40, 60), 3, (3, 4, 5), "confirmation60", (15, 30, 40, 60)),  # closed 2026-11-13
+            "60r": Attempt("OPPO60R", 60, (40, 60), None, (6, 7, 8), "confirmation60r", (15, 30, 40, 60), retain=0.15)}
 
 
 def run_dir(att: Attempt, opp: str, seed: int, smoke: bool = False) -> Path:
@@ -486,7 +566,7 @@ def train(a) -> dict:
             r = tr.run_world()
             if w % 2 == 0 or w >= 15 or w == a.worlds:
                 snapshot(tr, out / "snap" / f"w{w:02d}.pt")
-            if w in att.rollouts:
+            if w in att.rollouts or (smoke and w == a.worlds):
                 torch.save(tr.policies[0].rollout, out / "snap" / f"rollout_w{w:02d}.pt", pickle_protocol=5)
             st = r["learner"]["launderer"]
             kl = max(st.get("kl_final") or [float("nan")])
@@ -502,6 +582,7 @@ def train(a) -> dict:
     st = [e["learner"].get("launderer", {}) for e in tr.epochs]
     res = {"attempt": a.attempt, "opp": a.opp, "seed": a.seed, "worlds": a.worlds, "worlds_done": tr.world, "status": status,
            "git_sha": mt.git_sha(), "minutes": (time.perf_counter() - t0) / 60,
+           "actor_steps": int(sum(s.get("steps_accepted") or 0 for s in st)),
            "accounting_gap_max": max((abs(e["accounting_gap"]) for e in tr.epochs), default=0.0),
            "ratio_dev_max": max((s["ratio_dev_max"] for s in st if s.get("n")), default=None),
            "value_dev_max": max((s["value_dev_max"] for s in st if s.get("n")), default=None),
@@ -564,6 +645,8 @@ def cmd_run(a) -> None:
     """One block, one attempt: train, then read."""
     att = ATTEMPTS[a.attempt]
     smoke = a.worlds != att.worlds or a.eval_worlds is not None
+    if att.dev_seed is None:
+        raise SystemExit(f"attempt {a.attempt} has no development block (seed: its confirmation only)")
     if not smoke and a.seed != att.dev_seed:
         raise SystemExit(f"a development block of attempt {a.attempt} uses seed {att.dev_seed}")
     mark, info = _start(a, smoke)
@@ -578,12 +661,73 @@ def cmd_train(a) -> None:
     att = ATTEMPTS[a.attempt]
     smoke = a.worlds != att.worlds
     if not smoke and (a.seed == att.dev_seed or a.seed not in att.seeds):
-        raise SystemExit(f"attempt {a.attempt}'s confirmation trains seeds {[s for s in att.seeds if s != att.dev_seed]}; "
-                         f"seed {att.dev_seed} is the development blocks' run")
+        raise SystemExit(f"attempt {a.attempt}'s confirmation trains seeds {[s for s in att.seeds if s != att.dev_seed]}"
+                         + ("" if att.dev_seed is None else f"; seed {att.dev_seed} is the development blocks' run"))
     mark, info = _start(a, smoke)
     res = train(a)
     mark.write_text(json.dumps(info | {"state": f"trained: {res['status']}",
                                        "finished": time.strftime("%Y-%m-%d %H:%M:%S")}, indent=1))
+
+
+# ---------------------------------------------------------------------------- state use (reported)
+@torch.no_grad()
+def state_use(L, rows: list, chunk: int = 256) -> dict:
+    """How far the actor's choices depend on the state: reported, never gated (2026-11-13; the torchlens inspection
+    of attempts 30 and 60, ``runs/inspect_m5/oppo_lens.py``, found that they barely do). Over the saved decisions
+    ``rows`` at which a launch is feasible: the launch probability's 5 %, 50 % and 95 % quantiles and its mean by
+    balance band, and how far the launch probability (mean absolute change) and the mode distribution (mean total
+    variation) move at a decision when one source of state information is replaced by its mean over ``rows``:
+    ``controller``, every use of the controller features (their skip into the heads and the controller node); or
+    ``graph``, the whole graph readout after its LayerNorm. ``L``: the launderer's learner, its actor loaded."""
+    L.actor.eval()
+    batches = [(collate([r.obs for r in rows[i:i + chunk]]), np.stack([r.masks for r in rows[i:i + chunk]]))
+               for i in range(0, len(rows), chunk)]
+    x_c = np.concatenate([ob.x_c for ob, _ in batches])
+    feas = np.concatenate([m[:, P.SLICES["gate"]][:, P.LAUNCH] for _, m in batches])
+    x_mean = x_c.mean(0).astype(np.float32)
+
+    def tables(hook=None, ctrl_mean: bool = False):
+        h = L.actor.trunk.norm.register_forward_hook(hook) if hook is not None else None
+        try:
+            out = []
+            for ob, masks in batches:
+                if ctrl_mean:
+                    ob = replace(ob, x_c=np.broadcast_to(x_mean, ob.x_c.shape).copy())
+                t = L._forward(ob, masks)
+                out.append((t["gate"].exp()[:, P.LAUNCH].cpu().numpy(), t["mode"].exp().cpu().numpy()))
+        finally:
+            if h is not None:
+                h.remove()
+        return np.concatenate([x for x, _ in out])[feas], np.concatenate([x for _, x in out])[feas]
+
+    seen = []
+    p, mode = tables(lambda m, i, o: seen.append(o.sum(0)))            # also collects the readout's mean
+    if not feas.any():
+        return {"n": 0}
+    r_mean = torch.stack(seen).sum(0) / len(rows)
+    edits = {"controller": tables(ctrl_mean=True), "graph": tables(lambda m, i, o: r_mean.expand_as(o).clone())}
+    bal = x_c[feas, 1]
+    bands = {"low": bal < BANDS[0], "mid": (bal >= BANDS[0]) & (bal < BANDS[1]), "high": bal >= BANDS[1]}
+    return {"n": int(feas.sum()), "p_launch": [float(q) for q in np.quantile(p, [0.05, 0.5, 0.95])],
+            "p_launch_band": {k: (float(p[m].mean()) if m.any() else None) for k, m in bands.items()},
+            "band_n": {k: int(m.sum()) for k, m in bands.items()},
+            "dp_launch": {k: float(np.abs(p - q).mean()) for k, (q, _) in edits.items()},
+            "mode_tv": {k: float(0.5 * np.abs(mode - z).sum(1).mean()) for k, (_, z) in edits.items()}}
+
+
+def state_use_of_run(tr: mt.Trainer, out: Path, att: Attempt, snaps: tuple[int, int]) -> dict | None:
+    """``state_use`` of both snapshots of a run on its own saved training decisions (the attempt's last two saved
+    rollouts; a smoke run's last world). ``None`` if the run saved no rollout."""
+    files = [f for f in dict.fromkeys(out / "snap" / f"rollout_w{w:02d}.pt" for w in (*att.rollouts[-2:], snaps[1]))
+             if f.exists()]
+    rows = [r for f in files for r in torch.load(f, map_location="cpu", weights_only=False).rows]
+    if not rows:
+        return None
+    res = {"rollouts": [f.name for f in files], "decisions": len(rows)}
+    for w in snaps:
+        load_snapshot(tr, out / "snap" / f"w{w:02d}.pt")
+        res[str(w)] = state_use(tr.roles["launderer"], rows)
+    return res
 
 
 # ---------------------------------------------------------------------------- the confirmation
@@ -619,6 +763,11 @@ def cmd_confirm_eval(a) -> None:
                 rec["argmax"] = evaluate(tr, "argmax", worlds)
             except ABORTS:
                 rec["argmax"] = None
+            try:
+                rec["state_use"] = state_use_of_run(tr, out, att, (w20, w30))
+            except ABORTS:
+                rec["state_use"] = None
+            rec["actor_steps"] = res.get("actor_steps")
     f.write_text(json.dumps(rec, indent=1))
 
 
@@ -666,7 +815,7 @@ def read_confirmation(results: dict, evals: dict, refs: dict, worlds, att: Attem
     seed_skill = (M - unif["btc_utility"]).mean(1)
     c5 = bool(sk_u[0] >= SKILL_MIN and sk_u[1] > 0 and sk_i[0] >= SKILL_MIN and sk_i[1] > 0 and (seed_skill >= 0).sum() >= 2)
     keep = _t95((U - U20).mean(0))
-    c6 = bool(keep[1] > -RETAIN)
+    c6 = bool(keep[1] > -att.retain)
     out = {"status": "ok", "c1": bool(c1), "c2": c2, "c3": c3, "c4": c4, "c5": c5, "c6": c6,
            "utility": float(u.mean()), "reward": float(r.mean()), "utility_by_seed": dict(zip(seeds, U.mean(1).tolist())),
            "direct50": {"utility": float(d50["btc_utility"].mean()), "reward": float(d50["reward"].mean()),
@@ -677,7 +826,7 @@ def read_confirmation(results: dict, evals: dict, refs: dict, worlds, att: Attem
                        "initial": float(M0.mean()), "vs_uniform": list(sk_u), "vs_initial": list(sk_i),
                        "vs_uniform_by_seed": dict(zip(seeds, seed_skill.tolist())),
                        "initial_seed_spread": float(np.abs(M0 - M0[0]).max())},
-           "retention": list(keep)}
+           "retention": list(keep), "retention_margin": att.retain}
     return out | {"confirmed": all(out[f"c{i}"] for i in range(1, 7))}
 
 
@@ -701,6 +850,13 @@ def confirmation_reported(evals: dict, refs: dict, worlds, att: Attempt) -> dict
                 x[0], x[1] = x[0] + v["n"], x[1] + v["bias"] * v["n"]
     out["critic_strata"] = {k: {"n": n, "bias": b / n} for k, (n, b) in sorted(strata.items())}
     out["launches_by_mode"] = np.sum([r["options"]["launches"] for s in seeds for r in evals[s][k30]], 0).tolist()
+    k20 = f"natural_{att.snaps[0]}"                  # retention again, per seed and in the learner's own objective
+    d = lambda k: np.stack([col(evals[s][k30], k) - col(evals[s][k20], k) for s in seeds])   # noqa: E731
+    out["retention_by_seed"] = dict(zip(seeds, d("btc_utility").mean(1).tolist()))
+    out["retention_discounted"] = list(_t95(d("reward_discounted").mean(0)))
+    out["retention_discounted_by_seed"] = dict(zip(seeds, d("reward_discounted").mean(1).tolist()))
+    out["state_use"] = {s: evals[s].get("state_use") for s in seeds}
+    out["actor_steps"] = {s: evals[s].get("actor_steps") for s in seeds}
     return out
 
 
@@ -727,8 +883,60 @@ def cmd_confirm(a) -> None:
     print(json.dumps(out, indent=1))
 
 
+# ---------------------------------------------------------------------------- power (SPEC §16: stated before a run)
+def retention_power(true: float, sd: float, n: int, margin: float) -> float:
+    """The probability that a paired lower 95 % bound over ``n`` worlds lies above ``-margin`` when the true mean
+    difference is ``true`` and its world-to-world standard deviation ``sd`` (normal differences; noncentral t)."""
+    from scipy import stats
+    return float(stats.nct.sf(stats.t.ppf(0.975, n - 1), n - 1, (true + margin) * math.sqrt(n) / sd))
+
+
+def bootstrap_power(src: Attempt, att: Attempt, draws: int = 2000, seed: int = 0, smoke: bool = False) -> dict:
+    """How often runs like ``src``'s recorded ones would pass ``att``'s confirmation, per opponent: each draw
+    resamples ``src``'s confirmation worlds (with replacement, to ``att``'s number) and its seeds (with replacement)
+    and reads the six criteria under ``att``'s rules. It knows only what ``src``'s seeds did: a behaviour none of
+    them showed (a seed still holding at the endpoint) has probability zero here."""
+    if (src.worlds, src.snaps) != (att.worlds, att.snaps):
+        raise SystemExit("power: the recorded attempt must have the declared attempt's budget and snapshots")
+    rng, n_w, W = np.random.default_rng([seed, 99]), len(att.conf_worlds), src.conf_worlds
+    keys = [f"natural_{w}" for w in src.snaps] + ["matched", "initial"]
+    out = {}
+    for opp in r2.OPPS:
+        results = {s: _load(run_dir(src, opp, s, smoke) / "result.json") for s in src.seeds}
+        evals = {s: _load(run_dir(src, opp, s, smoke) / "confirm.json") for s in src.seeds}
+        files = {p: r2.ref_path(opp, src.panel, p, smoke) for p in r2.REFS}
+        if any(x["status"] != "ok" for x in (*results.values(), *evals.values())) or not all(f.exists() for f in files.values()):
+            out[opp] = None
+            continue
+        ev = {s: {k: _by_world(evals[s][k], W) for k in keys} for s in src.seeds}
+        refs = {p: _by_world(json.loads(f.read_text())["eval"], W) for p, f in files.items()}
+        n = np.zeros(7)
+        for _ in range(draws):
+            ws, ss = rng.integers(len(W), size=n_w), rng.choice(src.seeds, len(att.seeds))
+            pick = lambda rows: [rows[i] | {"world": j} for j, i in enumerate(ws)]      # noqa: E731
+            r = read_confirmation({k: results[s] for k, s in enumerate(ss)},
+                                  {k: {"status": "ok"} | {key: pick(ev[s][key]) for key in keys} for k, s in enumerate(ss)},
+                                  {p_: pick(x) for p_, x in refs.items()}, range(n_w), att)
+            n += [r[f"c{i}"] for i in range(1, 7)] + [r["confirmed"]]
+        out[opp] = {**{f"c{i + 1}": float(x) for i, x in enumerate(n[:6] / draws)}, "confirmed": float(n[6] / draws)}
+    return out
+
+
+def cmd_power(a) -> None:
+    """A declaration's power lines: retention alone at the recorded noise, and the bootstrap of a recorded attempt."""
+    att, src = ATTEMPTS[a.attempt], ATTEMPTS[a.source]
+    n = len(att.conf_worlds)
+    print(f"retention, lower 95 % bound above -{att.retain:g} over {n} worlds (attempt {a.attempt}):")
+    for sd in a.sd:
+        print(f"  world-to-world sd {sd:g}: " + ", ".join(
+            f"true {t:+.3f} -> {retention_power(t, sd, n, att.retain):.3f}" for t in (0.0, -0.036, -0.07, -att.retain)))
+    print(json.dumps({"source": a.source, "draws": a.draws, "pass": bootstrap_power(src, att, a.draws)}, indent=1))
+
+
 def cmd_read(a) -> None:
     att = ATTEMPTS[a.attempt]
+    if att.dev_seed is None:
+        raise SystemExit(f"attempt {a.attempt} has no development block (seed: its confirmation only)")
     smoke = a.worlds != att.worlds or a.eval_worlds is not None
     out = run_dir(att, a.opp, a.seed, smoke)
     if not (out / "result.json").exists() or (out / "oppo.json").exists():
@@ -740,10 +948,15 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     cmds = {"run": cmd_run, "read": cmd_read, "train": cmd_train, "confirm-eval": cmd_confirm_eval,
-            "confirm": cmd_confirm}
+            "confirm": cmd_confirm, "power": cmd_power}
     for name in cmds:
         p = sub.add_parser(name)
         p.add_argument("--attempt", choices=list(ATTEMPTS), default="30", help="the declared attempt (docstring)")
+        if name == "power":
+            p.add_argument("--source", choices=list(ATTEMPTS), required=True, help="the recorded attempt to resample")
+            p.add_argument("--sd", type=float, nargs="+", default=[0.063, 0.077], help="retention's world-to-world sd")
+            p.add_argument("--draws", type=int, default=2000)
+            continue
         if name != "confirm":
             p.add_argument("--opp", choices=list(r2.OPPS), required=True)
             p.add_argument("--seed", type=int, help="default: the attempt's development seed")
@@ -751,9 +964,14 @@ def main(argv=None) -> int:
         p.add_argument("--worlds", type=int, help="default: the attempt's; anything else is a smoke run")
         p.add_argument("--eval-worlds", type=int, help="a smoke run's evaluation worlds")
     a = ap.parse_args(argv)
+    if a.cmd == "power":
+        cmd_power(a)
+        return 0
     att = ATTEMPTS[a.attempt]
     a.worlds = att.worlds if a.worlds is None else a.worlds
     if a.cmd != "confirm" and a.seed is None:
+        if att.dev_seed is None:
+            raise SystemExit(f"attempt {a.attempt} has no development seed: give --seed (one of {list(att.seeds)})")
         a.seed = att.dev_seed
     cmds[a.cmd](a)
     return 0
