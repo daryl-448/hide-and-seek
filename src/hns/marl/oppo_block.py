@@ -313,6 +313,38 @@ first (state use at 40 and 60), and the next declaration changes the learner, no
 credit. Only the critic fails -> the critic is revised, not its tolerance. An incomplete or numerically failed step
 is never a pass; only the user may void an attempt for an established harness fault.
 
+**Reading of OPPO-MC-60R (2026-11-13, A30, run r_fe75184b, ``runs/repair2/oppo60r_confirmation.json``): confirmed
+against both opponents.** Every step completed (0 failed), from commit 88c24be; all six runs trained 60 worlds.
+
+- Full-0, **confirmed** (6 of 6): U +.579 (seeds .510, .658, .571; direct50 .677), R +.556; vs wait +.579 [+.553,
+  +.606]; critic bias +.19, +.16, +.00 (tolerance .5); held - direct50 -.071 [-.081, -.061]; matched +.640, vs
+  uniform +1.50 [+1.47, +1.52], vs initial +1.49 [+1.44, +1.54]; retention -.058 [-.081, -.034] (margin -.15).
+- NDA-1, **confirmed** (6 of 6): U +.504 (seeds .328, .582, .603; direct50 .663), R +.485; vs wait +.504 [+.473,
+  +.535]; critic bias +.20, -.01, -.06; held - direct50 -.046 [-.061, -.031]; matched +.627, vs uniform +1.57
+  [+1.53, +1.61], vs initial +1.56 [+1.51, +1.60]; retention -.091 [-.133, -.049] (margin -.15).
+- What the amended margin decided. Under the -.10 margin first approved, NDA-1 fails criterion 6 (its lower bound is
+  -.133) and Full-0 passes; under attempt 60's -.05 both fail. Both retention intervals exclude zero: in this attempt
+  the learner does lose utility between worlds 40 and 60. The pass is of the test as amended after attempt 60's
+  failure, not of the test first declared.
+- Reported, not gated. Retention by seed: -.122, +.015, -.066 (Full-0) and -.260, +.011, -.025 (NDA-1); in discounted
+  reward +.007 [-.088, +.102] and -.057 [-.173, +.058]. Seed 6 loses most against both opponents: its world-60 actor
+  puts 5.0 % and 5.8 % of its launches on non-direct modes (1.2 % and 0.3 % at world 40), and its frozen share rises
+  (.17 to .24, .19 to .31); its argmax policy scores .612 and .498. Final utility minus ``direct50``'s is -.098
+  [-.161, -.034] and -.159 [-.218, -.099]; minus ``repeat50``'s, -.150 [-.185, -.115] and -.109 [-.162, -.057].
+  Argmax by seed: .612, .634, .428 and .498, .621, .626. Natural launches are 90 % (Full-0) and 95 % (NDA-1) direct
+  at 0.5, 98 % direct at any amount. Kept actor steps per run: 693 to 1,319.
+- State use, as in attempts 30 and 60: the launch probability's 5 %-95 % range is at most 5.4 points wide in every
+  run and snapshot (at most 2.9 in eleven of the twelve); replacing the controller features moves it by at most 0.2
+  points, the graph readout by at most 1.4. From world 40 to world 60 its median rose in all six runs (.72 to .76,
+  .77 to .79, .65 to .87; .69 to .81, .81 to .90, .73 to .97).
+- Reproducibility. The three seeds' initial actors differ in one world per opponent (233 by .007, 237 by .009),
+  although each evaluation was its own process: GPU evaluation here is not bitwise reproducible. In training, two of
+  the six runs departed from the smoke run's first two worlds (same seeds and code, eight processes on the GPU).
+- The power line gave 97 % per opponent for runs like attempt 60's. These runs lost more after world 40 than attempt
+  60's did (-.058 and -.091 against -.036 and +.022).
+
+As declared, the next step is the live pilot (SPEC §10, step 3), declared in full before it runs.
+
 Usage::
 
     scripts/m5_repair2.sh oppo full0       (attempt 30: oppo_block run, train then read; the 45-minute cap)
