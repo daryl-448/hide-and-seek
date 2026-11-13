@@ -154,11 +154,56 @@ completed (0 failed).
 
 As declared, nothing is re-run; a new declaration follows.
 
+**Next attempt: OPPO-MC-60 (declared 2026-11-13 and approved by the user, before any of it ran; the seventh Sol
+consult, runs/sol_consult/CONSULT7.md and r11/DECLARATION_PROPOSAL.md).** The attempt above (``--attempt 30``) stays
+as read: Full-0 confirmed, NDA-1 not confirmed on utilization. Neither verdict is amended, and no old run is pooled
+with a new one. A CPU diagnostic after that reading continued NDA-1 seed 1 from world 30 on training worlds, unchanged
+(not an exact resume: the snapshots lacked the opponents' exploration stream), and its gate reopened (held .90 at
+world 31, .015 at world 48). That diagnostic is not an acceptance run, and its actor is never an initialization or a
+candidate. The user chose this budget-only attempt instead of the timing-only branch of "What follows" above.
+
+- The only change is the training budget: 60 complete worlds per run instead of 30 (``--attempt 60``). Worlds 1-5
+  are the options-first curriculum, worlds 6-60 natural. Networks, policy, wait durations, gamma, rewards, wealth
+  scale, advantage scale, entropy, optimizers, minibatches, the three 0.02-nat per-Adam-step KL checks and their
+  rollback, the simulator, the observations and the frozen opponents are unchanged. No launch floor, longer
+  curriculum, optimizer reset, guard relaxation, extra pass, temperature change or peak selection.
+- Development: fresh seed 3 against Full-0, then against NDA-1 as its own block, 60 worlds each; NDA-1 runs even if
+  Full-0 fails, unless the failure is a shared harness or implementation fault. Each block is one attempt, training
+  and reading together, under a 60-minute cap, on the JarvisLabs A30 (the user's choice), one block at a time. Read
+  on development worlds 100-103 from the world-40 and world-60 snapshots (natural), world-60 matched and world-60
+  argmax (reported), with the same references and the same five criteria, 40 in place of 20 and 60 in place of 30.
+  Only world 60 can pass. The development references are the published selection-world files (computed on the local
+  GPU on 2026-11-11), not recomputed.
+- Confirmation, only if both development blocks are promising: fresh seeds 4 and 5 against both opponents, 60 worlds
+  each, one attempt each (two-hour timeout per process). Seeds 3, 4 and 5 are evaluated on unused worlds 208-215
+  (``r2.PANELS["confirmation60"]``) with the references' view stream: natural at worlds 40 and 60, matched at world
+  60 and the initial actor, argmax at world 60 (reported). The scripted references are computed on 208-215 before
+  any learner evaluation runs. Each run's evaluation is its own fresh process, one at a time. The six criteria of
+  the confirmation above apply unchanged to seeds 3, 4 and 5, with 60 in place of 30 and 40 in place of 20; in
+  particular utilization stays the mean held excess over ``direct50`` of at most 0.05, over all three seeds. Full-0 is
+  re-confirmed: its training budget and endpoint changed too. Worlds 200-207 are not used again.
+- Records: ``OPPO60_{opp}_s{seed}``, markers ``oppo60_{opp}_s{seed}.json``, references ``ref_{opp}_confirmation60_*``,
+  the reading ``oppo60_confirmation.json``; nothing of attempt 30 is read or overwritten except the development
+  references and legacy A's and PL's records that the development reading uses. Snapshots keep the cadence (every
+  two worlds, every world from 15) through 60 and add the opponents' exploration and replay streams; complete
+  rollouts are saved at worlds 15, 30, 40 and 60.
+
+**What follows** (fixed now): both development blocks promising -> the confirmation. Held funds or natural economics
+fail while matched skill passes -> the 60-world budget test failed; diagnose support at the endpoint, and the next
+declaration is the timing-coverage package (a smooth launch floor of 0.10 and waits of 1 or 5 sub-steps), not an
+extension to 100 worlds or an earlier snapshot. Matched skill fails -> audit likelihoods, masks, credit and the
+amount and change choices on training states. Only the critic fails -> the critic is revised, not its tolerance.
+Retention fails -> audit the kept KL steps, optimizer geometry and support; world 40 is never eligible instead. An
+incomplete or numerically failed step is never a pass; only the user may void an attempt for an established harness
+fault. Both opponents confirmed -> the live pilot (SPEC §10, step 3: 60 fresh worlds per arm, a world-30 fork, worlds
+216-223), declared in full before it runs. Otherwise the failing criteria are reported and a new declaration follows.
+
 Usage::
 
-    scripts/m5_repair2.sh oppo full0       (oppo_block run: train, then read; the 45-minute cap)
+    scripts/m5_repair2.sh oppo full0       (attempt 30: oppo_block run, train then read; the 45-minute cap)
     python -m hns.marl.oppo_block read --opp full0     (only after a harness fault in the reading)
-    scripts/m5_oppo_confirm.sh             (on the A30: the confirmation's training, references, evaluation, reading)
+    scripts/m5_oppo_confirm.sh             (attempt 30, on the A30: the confirmation)
+    scripts/m5_oppo60.sh [smoke]           (attempt 60, on the A30: both development blocks, then the confirmation)
 """
 
 from __future__ import annotations
@@ -168,7 +213,7 @@ import json
 import shutil
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -180,31 +225,54 @@ import hns.marl.repair2 as r2
 import hns.marl.train as mt
 from hns.marl.capability import _t95
 from hns.marl.oppo import OptionPolicy, calibration, decision_summary
+from hns.sim.world import EPISODES
 
-WORLDS, DEV_WORLDS, SNAPS = 30, (100, 101, 102, 103), (20, 30)
-CONF_WORLDS, SEEDS = tuple(r2.PANELS["confirmation"]), (0, 1, 2)    # the confirmation (module docstring)
+DEV_WORLDS = (100, 101, 102, 103)
 RATIO_TOL = 1e-3
 ACCT_MAX, A_SLACK, RETAIN, HELD_SLACK, SKILL_MIN = 1e-6, 0.02, 0.05, 0.05, 0.02
 ABORTS = (FloatingPointError, RuntimeError, ValueError)     # numerical, chain and legality faults (and out of memory)
 
 
-def run_dir(opp: str, seed: int = 0, smoke: bool = False) -> Path:
-    return (r2.RUNS / "smoke" if smoke else r2.RUNS) / f"OPPO_{opp}_s{seed}"
+@dataclass(frozen=True)
+class Attempt:
+    """One declared attempt of the cycle (module docstring). Its records carry its own name, so no attempt reads or
+    overwrites another's."""
+    name: str                   # run directories ``{name}_{opp}_s{seed}``; markers and the reading in lower case
+    worlds: int                 # training worlds per run
+    snaps: tuple[int, int]      # the retention reference and the eligible endpoint
+    dev_seed: int               # the development blocks' launderer seed (also a confirmation seed)
+    seeds: tuple[int, ...]      # the confirmation's seeds
+    panel: str                  # ``r2.PANELS`` key of the confirmation worlds
+    rollouts: tuple[int, ...]   # training worlds whose complete decision rollout is saved
+
+    @property
+    def conf_worlds(self) -> tuple[int, ...]:
+        return tuple(r2.PANELS[self.panel])
 
 
-def mark_path(opp: str, seed: int = 0) -> Path:
-    return r2.RUNS / f"oppo_{opp}_s{seed}.json"
+ATTEMPTS = {"30": Attempt("OPPO", 30, (20, 30), 0, (0, 1, 2), "confirmation", (15, 30)),          # closed 2026-11-13
+            "60": Attempt("OPPO60", 60, (40, 60), 3, (3, 4, 5), "confirmation60", (15, 30, 40, 60))}
 
 
-def make(opp: str, seed: int, device, out: Path | None = None) -> mt.Trainer:
-    return cap.make(r2.OPPS[opp], device, out, seed=seed, launderer="oppo")
+def run_dir(att: Attempt, opp: str, seed: int, smoke: bool = False) -> Path:
+    return (r2.RUNS / "smoke" if smoke else r2.RUNS) / f"{att.name}_{opp}_s{seed}"
+
+
+def mark_path(att: Attempt, opp: str, seed: int, smoke: bool = False) -> Path:
+    return (r2.RUNS / "smoke" if smoke else r2.RUNS) / f"{att.name.lower()}_{opp}_s{seed}.json"
+
+
+def make(att: Attempt, opp: str, seed: int, device, out: Path | None = None) -> mt.Trainer:
+    return cap.make(r2.OPPS[opp], device, out, seed=seed, launderer="oppo", episodes=att.worlds * EPISODES)
 
 
 # ---------------------------------------------------------------------------- snapshots
 def snapshot(tr: mt.Trainer, path: Path) -> None:
     pol = tr.policies[0]
-    torch.save({"world": tr.world, **tr.roles["launderer"].state(), "rng": pol.rng.bit_generator.state,
-                "sched": pol.sched_rng.bit_generator.state, "rng_cpu": torch.get_rng_state(),
+    torch.save({"world": tr.world, "step_no": tr.step_no, **tr.roles["launderer"].state(),
+                "rng": pol.rng.bit_generator.state, "sched": pol.sched_rng.bit_generator.state,
+                "opp_rng": tr.rng.bit_generator.state, "replay_rng": tr.replay_rng.bit_generator.state,
+                "rng_cpu": torch.get_rng_state(),
                 "rng_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}, path)
 
 
@@ -254,9 +322,11 @@ def _dev(rows: list[dict]) -> list[dict]:
     return [by[j] for j in DEV_WORLDS if j in by]
 
 
-def read_block(res: dict, snaps: dict | None, matched: list[dict] | None, refs: dict, a_final: list[dict]) -> dict:
+def read_block(res: dict, snaps: dict | None, matched: list[dict] | None, refs: dict, a_final: list[dict],
+               n_worlds: int) -> dict:
     """The five criteria (module docstring). ``snaps``: world -> natural records on ``DEV_WORLDS`` (``None`` if
-    the run or its evaluation aborted); ``refs``: the reference policies' records on the same worlds."""
+    the run or its evaluation aborted); ``refs``: the reference policies' records on the same worlds; ``n_worlds``:
+    the attempt's training worlds."""
     if res["status"] != "ok" or snaps is None or matched is None:
         return {"status": res["status"], **{f"c{i}": False for i in range(1, 6)}, "promising": False}
     col = r2._col
@@ -266,7 +336,7 @@ def read_block(res: dict, snaps: dict | None, matched: list[dict] | None, refs: 
     d50 = refs["direct50"]
     ud, rd, ua = col(d50, "btc_utility"), col(d50, "reward"), col(a_final, "btc_utility")
     u_bar = max(0.5 * ud.mean(), ua.mean() - A_SLACK)
-    c1 = (res["worlds_done"] == WORLDS and res["accounting_gap_max"] <= ACCT_MAX
+    c1 = (res["worlds_done"] == n_worlds and res["accounting_gap_max"] <= ACCT_MAX
           and res["ratio_dev_max"] is not None and res["ratio_dev_max"] <= RATIO_TOL)
     c2 = u[last].mean() > 0 and u[last].mean() >= u_bar and rew.mean() >= 0.5 * rd.mean()
     keep = u[last] - u[first]
@@ -304,7 +374,7 @@ def reported(snaps: dict, refs: dict, opp: str, argmax: list[dict] | None) -> di
                            "reward": list(_t95(rw - col(refs[name], "reward")))}
     f = r2.run_dir("PL", opp, 0) / "stage1.json"
     if f.exists() and json.loads(f.read_text())["snaps"] is not None:
-        pl = _dev(json.loads(f.read_text())["snaps"][str(SNAPS[-1])])
+        pl = _dev(json.loads(f.read_text())["snaps"]["30"])                # PL's world-30 network
         pl = [r for r in pl if r["world"] in {x["world"] for x in last}]
         out["vs"]["PL_w30"] = {"utility": list(_t95(u - col(pl, "btc_utility"))),
                                "held": float(col(pl, "held_frac").mean())}
@@ -353,17 +423,18 @@ def training_summary(out: Path) -> dict:
 
 # ---------------------------------------------------------------------------- commands
 def train(a) -> dict:
-    smoke = a.worlds != WORLDS
-    out = run_dir(a.opp, a.seed, smoke)
+    att = ATTEMPTS[a.attempt]
+    smoke = a.worlds != att.worlds
+    out = run_dir(att, a.opp, a.seed, smoke)
     if out.exists():
         if not smoke:
             raise SystemExit(f"{out}: a block's run is not restarted")
         shutil.rmtree(out)
     (out / "snap").mkdir(parents=True)
-    tr = make(a.opp, a.seed, torch.device(a.device), out)
+    tr = make(att, a.opp, a.seed, torch.device(a.device), out)
     (out / "config.yaml").write_text(yaml.safe_dump(
         {**asdict(tr.cfg), "opponent": str(r2.OPPS[a.opp]), "opp_eps": cap.OPP_EPS,
-         "learn": ["launderer"], "git_sha": mt.git_sha()}, sort_keys=False))
+         "learn": ["launderer"], "attempt": a.attempt, "git_sha": mt.git_sha()}, sort_keys=False))
     (out / "metrics.jsonl").write_text("")
     snapshot(tr, out / "snap" / "w00.pt")
     status, t0 = "ok", time.perf_counter()
@@ -372,7 +443,7 @@ def train(a) -> dict:
             r = tr.run_world()
             if w % 2 == 0 or w >= 15 or w == a.worlds:
                 snapshot(tr, out / "snap" / f"w{w:02d}.pt")
-            if w in (15, 30):
+            if w in att.rollouts:
                 torch.save(tr.policies[0].rollout, out / "snap" / f"rollout_w{w:02d}.pt", pickle_protocol=5)
             st = r["learner"]["launderer"]
             kl = max(st.get("kl_final") or [float("nan")])
@@ -386,7 +457,7 @@ def train(a) -> dict:
         status = f"aborted: {type(e).__name__}: {e}"
         print(f"{out.name}: {status}", flush=True)
     st = [e["learner"].get("launderer", {}) for e in tr.epochs]
-    res = {"opp": a.opp, "seed": a.seed, "worlds": a.worlds, "worlds_done": tr.world, "status": status,
+    res = {"attempt": a.attempt, "opp": a.opp, "seed": a.seed, "worlds": a.worlds, "worlds_done": tr.world, "status": status,
            "git_sha": mt.git_sha(), "minutes": (time.perf_counter() - t0) / 60,
            "accounting_gap_max": max((abs(e["accounting_gap"]) for e in tr.epochs), default=0.0),
            "ratio_dev_max": max((s["ratio_dev_max"] for s in st if s.get("n")), default=None),
@@ -397,20 +468,21 @@ def train(a) -> dict:
 
 
 def read(a) -> dict:
-    smoke = a.worlds != WORLDS or a.eval_worlds is not None
-    out = run_dir(a.opp, a.seed, smoke)
+    att = ATTEMPTS[a.attempt]
+    smoke = a.worlds != att.worlds or a.eval_worlds is not None
+    out = run_dir(att, a.opp, a.seed, smoke)
     res = json.loads((out / "result.json").read_text())
     worlds = DEV_WORLDS[:a.eval_worlds]
-    snap_worlds = SNAPS if not smoke else (0, a.worlds)          # a smoke run reads its first and last snapshot
+    snap_worlds = att.snaps if not smoke else (0, a.worlds)      # a smoke run reads its first and last snapshot
     snaps = matched = argmax = None
     if res["status"] == "ok":
-        tr = make(a.opp, a.seed, torch.device(a.device))
+        tr = make(att, a.opp, a.seed, torch.device(a.device))
         try:
             snaps = {}
             for w in snap_worlds:
                 load_snapshot(tr, out / "snap" / f"w{w:02d}.pt")
                 snaps[w] = evaluate(tr, "natural", worlds)
-            matched = evaluate(tr, "matched", worlds)                  # the world-30 snapshot is loaded
+            matched = evaluate(tr, "matched", worlds)                  # the endpoint's snapshot is loaded
         except ABORTS as e:
             res, snaps = res | {"status": f"aborted in the reading: {type(e).__name__}: {e}"}, None
         if snaps is not None:                                          # reported only
@@ -421,10 +493,10 @@ def read(a) -> dict:
     refs = {p: [r for r in r2._refs(a.opp, "selection")[p] if r["world"] in worlds] for p in r2.REFS}
     a_final = [r for r in json.loads((r2.run_dir("A", a.opp, 0) / "result.json").read_text())["eval"]["boltzmann"]
                if r["world"] in worlds]
-    reading = read_block(res, snaps, matched, refs, a_final)
+    reading = read_block(res, snaps, matched, refs, a_final, att.worlds)
     rep = reported(snaps, refs, a.opp, argmax) if snaps is not None else None
     (out / "oppo.json").write_text(json.dumps(
-        {"opp": a.opp, "seed": a.seed, "reading": reading, "reported": rep, "training": training_summary(out),
+        {"attempt": a.attempt, "opp": a.opp, "seed": a.seed, "reading": reading, "reported": rep, "training": training_summary(out),
          "snaps": None if snaps is None else {str(w): v for w, v in snaps.items()}, "matched": matched,
          "argmax": argmax}, indent=1))
     print(json.dumps(reading, indent=1))
@@ -435,19 +507,22 @@ def read(a) -> dict:
 
 def _start(a, smoke: bool) -> tuple[Path, dict]:
     """One attempt: the marker written first makes a second start refuse."""
-    mark = mark_path(a.opp, a.seed) if not smoke else r2.RUNS / "smoke" / f"oppo_{a.opp}_s{a.seed}.json"
+    mark = mark_path(ATTEMPTS[a.attempt], a.opp, a.seed, smoke)
     if mark.exists() and not smoke:
         raise SystemExit(f"{mark}: this run was already attempted ({json.loads(mark.read_text())['state']}); "
                          "it is not run again")
     mark.parent.mkdir(parents=True, exist_ok=True)
-    info = {"opp": a.opp, "seed": a.seed, "started": time.strftime("%Y-%m-%d %H:%M:%S"), "state": "started"}
+    info = {"attempt": a.attempt, "opp": a.opp, "seed": a.seed, "started": time.strftime("%Y-%m-%d %H:%M:%S"), "state": "started"}
     mark.write_text(json.dumps(info, indent=1))
     return mark, info
 
 
 def cmd_run(a) -> None:
     """One block, one attempt: train, then read."""
-    smoke = a.worlds != WORLDS or a.eval_worlds is not None
+    att = ATTEMPTS[a.attempt]
+    smoke = a.worlds != att.worlds or a.eval_worlds is not None
+    if not smoke and a.seed != att.dev_seed:
+        raise SystemExit(f"a development block of attempt {a.attempt} uses seed {att.dev_seed}")
     mark, info = _start(a, smoke)
     train(a)
     reading = read(a)
@@ -457,9 +532,11 @@ def cmd_run(a) -> None:
 
 def cmd_train(a) -> None:
     """A confirmation seed's run, one attempt: training only (``confirm-eval`` reads it)."""
-    smoke = a.worlds != WORLDS
-    if a.seed == 0 and not smoke:
-        raise SystemExit("seed 0 is the development block's run")
+    att = ATTEMPTS[a.attempt]
+    smoke = a.worlds != att.worlds
+    if not smoke and (a.seed == att.dev_seed or a.seed not in att.seeds):
+        raise SystemExit(f"attempt {a.attempt}'s confirmation trains seeds {[s for s in att.seeds if s != att.dev_seed]}; "
+                         f"seed {att.dev_seed} is the development blocks' run")
     mark, info = _start(a, smoke)
     res = train(a)
     mark.write_text(json.dumps(info | {"state": f"trained: {res['status']}",
@@ -468,21 +545,26 @@ def cmd_train(a) -> None:
 
 # ---------------------------------------------------------------------------- the confirmation
 def cmd_confirm_eval(a) -> None:
-    """One run on the confirmation worlds: natural world 20 and 30, matched world 30 and the initial actor, argmax
-    world 30 (module docstring). A smoke run reads its first and last snapshot in place of worlds 20 and 30."""
-    smoke = a.worlds != WORLDS or a.eval_worlds is not None
-    out = run_dir(a.opp, a.seed, smoke)
+    """One run on the confirmation worlds: natural at both snapshots (attempt 30: worlds 20 and 30), matched at the
+    endpoint and the initial actor, argmax at the endpoint (module docstring). A smoke run reads its first and last
+    snapshot in their place."""
+    att = ATTEMPTS[a.attempt]
+    smoke = a.worlds != att.worlds or a.eval_worlds is not None
+    if not smoke and a.seed not in att.seeds:
+        raise SystemExit(f"attempt {a.attempt}'s confirmation reads seeds {list(att.seeds)}")
+    out = run_dir(att, a.opp, a.seed, smoke)
     f = out / "confirm.json"
     if f.exists():
         raise SystemExit(f"{f}: this run was already evaluated")
     res = json.loads((out / "result.json").read_text())
-    worlds = CONF_WORLDS[:a.eval_worlds]
-    w20, w30 = SNAPS if a.worlds == WORLDS else (0, a.worlds)
-    rec = {"opp": a.opp, "seed": a.seed, "worlds": list(worlds), "status": res["status"], "git_sha": mt.git_sha()}
+    worlds = att.conf_worlds[:a.eval_worlds]
+    w20, w30 = att.snaps if a.worlds == att.worlds else (0, a.worlds)
+    k20, k30 = (f"natural_{w}" for w in att.snaps)
+    rec = {"attempt": a.attempt, "opp": a.opp, "seed": a.seed, "worlds": list(worlds), "status": res["status"], "git_sha": mt.git_sha()}
     if res["status"] == "ok":
-        tr = make(a.opp, a.seed, torch.device(a.device))
+        tr = make(att, a.opp, a.seed, torch.device(a.device))
         try:
-            for key, w, mode in (("natural_20", w20, "natural"), ("natural_30", w30, "natural"),
+            for key, w, mode in ((k20, w20, "natural"), (k30, w30, "natural"),
                                  ("matched", w30, "matched"), ("initial", 0, "matched")):
                 load_snapshot(tr, out / "snap" / f"w{w:02d}.pt")
                 rec[key] = evaluate(tr, mode, worlds)
@@ -507,7 +589,7 @@ def _by_world(rows: list[dict], worlds) -> list[dict]:
     return [by[j] for j in worlds]
 
 
-def read_confirmation(results: dict, evals: dict, refs: dict, worlds) -> dict:
+def read_confirmation(results: dict, evals: dict, refs: dict, worlds, att: Attempt) -> dict:
     """The six criteria for one opponent (module docstring). ``results`` / ``evals``: seed -> ``result.json`` /
     ``confirm.json`` (``_load``: a missing file is an incomplete record); ``refs``: the scripted policies' records on
     ``worlds``, or ``None`` if any is missing. Anything not ok leaves the opponent incomplete, never read."""
@@ -518,16 +600,16 @@ def read_confirmation(results: dict, evals: dict, refs: dict, worlds) -> dict:
         return {"status": "; ".join(bad), **{f"c{i}": False for i in range(1, 7)}, "confirmed": False}
     col = lambda rows, k: r2._col(_by_world(rows, worlds), k)                     # noqa: E731
     m = lambda key, k: np.stack([col(evals[s][key], k) for s in seeds])          # noqa: E731  (seed, world)
-    U, R, H, U20 = m("natural_30", "btc_utility"), m("natural_30", "reward"), m("natural_30", "held_frac"), \
-        m("natural_20", "btc_utility")
+    k20, k30 = (f"natural_{w}" for w in att.snaps)
+    U, R, H, U20 = m(k30, "btc_utility"), m(k30, "reward"), m(k30, "held_frac"), m(k20, "btc_utility")
     M, M0 = m("matched", "btc_utility"), m("initial", "btc_utility")
     ref = {p: {k: col(refs[p], k) for k in ("btc_utility", "reward", "held_frac")} for p in refs}
     d50, wait, unif = ref["direct50"], ref["wait"], ref["uniform"]
-    c1 = all(results[s]["worlds_done"] == WORLDS and results[s]["accounting_gap_max"] <= ACCT_MAX
+    c1 = all(results[s]["worlds_done"] == att.worlds and results[s]["accounting_gap_max"] <= ACCT_MAX
              and results[s]["ratio_dev_max"] is not None and results[s]["ratio_dev_max"] <= RATIO_TOL for s in seeds)
     critic = {}
     for s in seeds:
-        cal = [r["cal"] for r in _by_world(evals[s]["natural_30"], worlds)]
+        cal = [r["cal"] for r in _by_world(evals[s][k30], worlds)]
         b, g = float(np.mean([c["bias"] for c in cal])), float(np.mean([c["g_abs"] for c in cal]))
         critic[s] = {"bias": b, "g_abs": g, "tolerance": max(0.5, 0.25 * g), "ok": abs(b) <= max(0.5, 0.25 * g)}
     c2 = all(c["ok"] for c in critic.values())
@@ -556,52 +638,56 @@ def read_confirmation(results: dict, evals: dict, refs: dict, worlds) -> dict:
     return out | {"confirmed": all(out[f"c{i}"] for i in range(1, 7))}
 
 
-def confirmation_reported(evals: dict, refs: dict, worlds) -> dict:
+def confirmation_reported(evals: dict, refs: dict, worlds, att: Attempt) -> dict:
     """Not gated: differences to direct50 and repeat50, the argmax policy, proceeds, critic strata, launch modes."""
-    seeds = sorted(evals)
+    seeds, k30 = sorted(evals), f"natural_{att.snaps[1]}"
     col = lambda rows, k: r2._col(_by_world(rows, worlds), k)                     # noqa: E731
-    u = np.mean([col(evals[s]["natural_30"], "btc_utility") for s in seeds], 0)
-    rw = np.mean([col(evals[s]["natural_30"], "reward") for s in seeds], 0)
+    u = np.mean([col(evals[s][k30], "btc_utility") for s in seeds], 0)
+    rw = np.mean([col(evals[s][k30], "reward") for s in seeds], 0)
     out = {"vs": {p: {"utility": list(_t95(u - col(refs[p], "btc_utility"))),
                       "reward": list(_t95(rw - col(refs[p], "reward")))} for p in ("direct50", "repeat50")}}
     out["argmax_by_seed"] = {s: (float(col(evals[s]["argmax"], "btc_utility").mean()) if evals[s].get("argmax") else None)
                              for s in seeds}
-    out["proceeds"] = {k: float(np.mean([col(evals[s]["natural_30"], k) for s in seeds]))
+    out["proceeds"] = {k: float(np.mean([col(evals[s][k30], k) for s in seeds]))
                        for k in ("success_frac", "frozen_frac", "fee_frac", "held_frac", "tranches", "detection_rate")}
     strata: dict = {}
     for s in seeds:
-        for r in evals[s]["natural_30"]:
+        for r in evals[s][k30]:
             for k, v in r["cal"].get("strata", {}).items():
                 x = strata.setdefault(k, [0, 0.0])
                 x[0], x[1] = x[0] + v["n"], x[1] + v["bias"] * v["n"]
     out["critic_strata"] = {k: {"n": n, "bias": b / n} for k, (n, b) in sorted(strata.items())}
-    out["launches_by_mode"] = np.sum([r["options"]["launches"] for s in seeds for r in evals[s]["natural_30"]], 0).tolist()
+    out["launches_by_mode"] = np.sum([r["options"]["launches"] for s in seeds for r in evals[s][k30]], 0).tolist()
     return out
 
 
 def cmd_confirm(a) -> None:
     """The confirmation's reading for both opponents (module docstring)."""
-    smoke = a.worlds != WORLDS or a.eval_worlds is not None
-    worlds = CONF_WORLDS[:a.eval_worlds]
-    out = {"worlds": list(worlds), "opponents": {}}
+    att = ATTEMPTS[a.attempt]
+    smoke = a.worlds != att.worlds or a.eval_worlds is not None
+    f = (r2.RUNS / "smoke" if smoke else r2.RUNS) / f"{att.name.lower()}_confirmation.json"
+    if f.exists() and not smoke:
+        raise SystemExit(f"{f}: this confirmation was already read; it is not read again")
+    worlds = att.conf_worlds[:a.eval_worlds]
+    out = {"attempt": a.attempt, "worlds": list(worlds), "opponents": {}}
     for opp in r2.OPPS:
-        results = {s: _load(run_dir(opp, s, smoke) / "result.json") for s in SEEDS}
-        evals = {s: _load(run_dir(opp, s, smoke) / "confirm.json") for s in SEEDS}
-        files = {p: r2.ref_path(opp, "confirmation", p, smoke) for p in r2.REFS}
+        results = {s: _load(run_dir(att, opp, s, smoke) / "result.json") for s in att.seeds}
+        evals = {s: _load(run_dir(att, opp, s, smoke) / "confirm.json") for s in att.seeds}
+        files = {p: r2.ref_path(opp, att.panel, p, smoke) for p in r2.REFS}
         refs = ({p: [r for r in json.loads(f.read_text())["eval"] if r["world"] in worlds] for p, f in files.items()}
                 if all(f.exists() for f in files.values()) else None)
-        verdict = read_confirmation(results, evals, refs, worlds)
-        rep = confirmation_reported(evals, refs, worlds) if verdict["status"] == "ok" else None
+        verdict = read_confirmation(results, evals, refs, worlds, att)
+        rep = confirmation_reported(evals, refs, worlds, att) if verdict["status"] == "ok" else None
         out["opponents"][opp] = {"reading": verdict, "reported": rep}
     out["confirmed"] = all(o["reading"]["confirmed"] for o in out["opponents"].values())
-    f = (r2.RUNS / "smoke" if smoke else r2.RUNS) / "oppo_confirmation.json"
     f.write_text(json.dumps(out, indent=1))
     print(json.dumps(out, indent=1))
 
 
 def cmd_read(a) -> None:
-    smoke = a.worlds != WORLDS or a.eval_worlds is not None
-    out = run_dir(a.opp, a.seed, smoke)
+    att = ATTEMPTS[a.attempt]
+    smoke = a.worlds != att.worlds or a.eval_worlds is not None
+    out = run_dir(att, a.opp, a.seed, smoke)
     if not (out / "result.json").exists() or (out / "oppo.json").exists():
         raise SystemExit(f"{out}: read finishes a block whose training completed and whose reading did not run")
     read(a)
@@ -614,13 +700,18 @@ def main(argv=None) -> int:
             "confirm": cmd_confirm}
     for name in cmds:
         p = sub.add_parser(name)
+        p.add_argument("--attempt", choices=list(ATTEMPTS), default="30", help="the declared attempt (docstring)")
         if name != "confirm":
             p.add_argument("--opp", choices=list(r2.OPPS), required=True)
-            p.add_argument("--seed", type=int, default=0)
+            p.add_argument("--seed", type=int, help="default: the attempt's development seed")
             p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-        p.add_argument("--worlds", type=int, default=WORLDS, help="anything else is a smoke run")
+        p.add_argument("--worlds", type=int, help="default: the attempt's; anything else is a smoke run")
         p.add_argument("--eval-worlds", type=int, help="a smoke run's evaluation worlds")
     a = ap.parse_args(argv)
+    att = ATTEMPTS[a.attempt]
+    a.worlds = att.worlds if a.worlds is None else a.worlds
+    if a.cmd != "confirm" and a.seed is None:
+        a.seed = att.dev_seed
     cmds[a.cmd](a)
     return 0
 

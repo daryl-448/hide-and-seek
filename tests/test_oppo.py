@@ -489,7 +489,7 @@ def test_block_reading_has_five_criteria():
     res = {"status": "ok", "worlds_done": 30, "accounting_gap_max": 0.0, "ratio_dev_max": 1e-6}
     good = {20: _rows([0.45] * 4), 30: _rows([0.5] * 4, held=0.1)}
     matched = _rows([0.3] * 4)
-    r = ob.read_block(res, good, matched, refs, a_final)
+    r = ob.read_block(res, good, matched, refs, a_final, 30)
     assert r["promising"] and math.isclose(r["utility_bar"], 0.40) and math.isclose(r["reward_bar"], 0.35)
     fails = {
         "c1": dict(res=res | {"ratio_dev_max": 0.01}), "c2": dict(snaps={20: _rows([0.40] * 4), 30: _rows([0.39] * 4)}),
@@ -498,12 +498,13 @@ def test_block_reading_has_five_criteria():
         "c5": dict(snaps={20: good[20], 30: _rows([0.5] * 4, held=0.14)}),
     }
     for c, kw in fails.items():
-        x = ob.read_block(kw.get("res", res), kw.get("snaps", good), matched, refs, a_final)
+        x = ob.read_block(kw.get("res", res), kw.get("snaps", good), matched, refs, a_final, 30)
         assert not x[c] and not x["promising"] and all(x[k] for k in ("c1", "c2", "c3", "c4", "c5") if k != c), c
-    assert not ob.read_block(res, good, _rows([-0.79] * 4), refs, a_final)["c5"]      # matched skill under 0.02
+    assert not ob.read_block(res, good, _rows([-0.79] * 4), refs, a_final, 30)["c5"]  # matched skill under 0.02
     big = {20: good[20], 30: _rows([0.5] * 4, held=0.1, bias=1.9, g_abs=8.0)}         # tolerance 0.25 mean |G|
-    assert ob.read_block(res, big, matched, refs, a_final)["c4"]
-    assert not ob.read_block(res | {"status": "aborted: x"}, good, matched, refs, a_final)["promising"]
+    assert ob.read_block(res, big, matched, refs, a_final, 30)["c4"]
+    assert not ob.read_block(res | {"status": "aborted: x"}, good, matched, refs, a_final, 30)["promising"]
+    assert not ob.read_block(res, good, matched, refs, a_final, 60)["c1"]            # attempt 60 needs 60 worlds
 
 
 # ---------------------------------------------------------------------------- the confirmation's reading
@@ -521,44 +522,45 @@ def _conf_refs(W):
             "wait": _conf_rows(_NOISE, W), "repeat50": _conf_rows(0.65, W)}
 
 
-def _conf_res():
-    return {"status": "ok", "worlds_done": 30, "accounting_gap_max": 0.0, "ratio_dev_max": 1e-6}
+def _conf_res(worlds=30):
+    return {"status": "ok", "worlds_done": worlds, "accounting_gap_max": 0.0, "ratio_dev_max": 1e-6}
 
 
-def _conf_ev(W, u30=0.5, u20=0.3, matched=0.5, initial=-0.8, held=0.06, bias=0.1, status="ok"):
-    return {"status": status, "natural_30": _conf_rows(u30 + _NOISE, W, held=held, bias=bias),
-            "natural_20": _conf_rows(u20 + _NOISE, W), "matched": _conf_rows(matched + _NOISE, W),
+def _conf_ev(W, u30=0.5, u20=0.3, matched=0.5, initial=-0.8, held=0.06, bias=0.1, status="ok", snaps=(20, 30)):
+    return {"status": status, f"natural_{snaps[1]}": _conf_rows(u30 + _NOISE, W, held=held, bias=bias),
+            f"natural_{snaps[0]}": _conf_rows(u20 + _NOISE, W), "matched": _conf_rows(matched + _NOISE, W),
             "initial": _conf_rows(initial + _NOISE, W)}
 
 
 def test_confirmation_reading_has_six_criteria():
     from hns.marl import oppo_block as ob
 
-    W = ob.CONF_WORLDS
-    refs, res = _conf_refs(W), {s: _conf_res() for s in ob.SEEDS}
+    att = ob.ATTEMPTS["30"]
+    W, SEEDS = att.conf_worlds, att.seeds
+    refs, res = _conf_refs(W), {s: _conf_res() for s in SEEDS}
     ev = lambda **kw: _conf_ev(W, **kw)                                  # noqa: E731
-    good = {s: ev() for s in ob.SEEDS}
-    r = ob.read_confirmation(res, good, refs, W)
+    good = {s: ev() for s in SEEDS}
+    r = ob.read_confirmation(res, good, refs, W, att)
     assert r["confirmed"] and all(r[f"c{i}"] for i in range(1, 7)), r
     assert r["matched"]["initial_seed_spread"] == 0.0
     fails = {
         "c1": dict(res=res | {1: res[1] | {"worlds_done": 29}}),
         "c2": dict(evals=good | {2: ev(bias=0.6)}),                    # one seed's critic is enough to fail
         "c3": dict(evals={0: ev(u30=0.4), 1: ev(u30=-0.1, u20=-0.1), 2: ev(u30=-0.1, u20=-0.1)}),  # 1 of 3 seeds positive
-        "c4": dict(evals={s: ev(held=0.14) for s in ob.SEEDS}),
+        "c4": dict(evals={s: ev(held=0.14) for s in SEEDS}),
         "c5": dict(evals={0: ev(matched=0.5), 1: ev(matched=-0.9), 2: ev(matched=-0.9)}),        # 1 of 3 seeds >= uniform
-        "c6": dict(evals={s: ev(u20=0.6) for s in ob.SEEDS}),
+        "c6": dict(evals={s: ev(u20=0.6) for s in SEEDS}),
     }
     for c, kw in fails.items():
-        x = ob.read_confirmation(kw.get("res", res), kw.get("evals", good), refs, W)
+        x = ob.read_confirmation(kw.get("res", res), kw.get("evals", good), refs, W, att)
         assert not x[c] and not x["confirmed"], (c, x)
         assert all(x[k] for k in ("c1", "c2", "c3", "c4", "c5", "c6") if k != c), (c, x)
-    x = ob.read_confirmation(res, good | {1: ev(status="aborted in the evaluation: x")}, refs, W)
+    x = ob.read_confirmation(res, good | {1: ev(status="aborted in the evaluation: x")}, refs, W, att)
     assert x["status"] == "seed 1 evaluation: aborted in the evaluation: x" and not x["confirmed"]
     # the initial actor is a separate bar: matched skill over uniform alone is not enough
-    x = ob.read_confirmation(res, {s: ev(initial=0.49) for s in ob.SEEDS}, refs, W)
+    x = ob.read_confirmation(res, {s: ev(initial=0.49) for s in SEEDS}, refs, W, att)
     assert not x["c5"] and x["c1"] and x["c6"]
-    x = ob.read_confirmation(res, good, None, W)                       # references missing
+    x = ob.read_confirmation(res, good, None, W, att)                  # references missing
     assert x["status"] == "references: incomplete" and not x["confirmed"]
 
 
@@ -570,17 +572,18 @@ def test_confirmation_reads_one_opponent_when_the_other_left_no_records(tmp_path
 
     monkeypatch.setattr(r2, "RUNS", tmp_path)
     monkeypatch.setattr(ob, "confirmation_reported", lambda *a: {"reported": True})   # not gated; needs full records
-    W = ob.CONF_WORLDS
-    for s in ob.SEEDS:                                                  # full0: complete; nda1: nothing at all
-        d = ob.run_dir("full0", s)
+    att = ob.ATTEMPTS["30"]
+    W = att.conf_worlds
+    for s in att.seeds:                                                 # full0: complete; nda1: nothing at all
+        d = ob.run_dir(att, "full0", s)
         d.mkdir(parents=True)
         (d / "result.json").write_text(json.dumps(_conf_res()))
         (d / "confirm.json").write_text(json.dumps(_conf_ev(W)))
     for p, rows in _conf_refs(W).items():
         r2.ref_path("full0", "confirmation", p).write_text(json.dumps({"eval": rows}))
-    (ob.run_dir("nda1", 1)).mkdir(parents=True)
-    (ob.run_dir("nda1", 1) / "result.json").write_text(json.dumps(_conf_res()))   # trained, but never evaluated
-    ob.cmd_confirm(argparse.Namespace(worlds=ob.WORLDS, eval_worlds=None))
+    (ob.run_dir(att, "nda1", 1)).mkdir(parents=True)
+    (ob.run_dir(att, "nda1", 1) / "result.json").write_text(json.dumps(_conf_res()))   # trained, never evaluated
+    ob.cmd_confirm(argparse.Namespace(attempt="30", worlds=att.worlds, eval_worlds=None))
     out = json.loads((tmp_path / "oppo_confirmation.json").read_text())
     assert out["opponents"]["full0"]["reading"]["confirmed"] and out["opponents"]["full0"]["reported"] is not None
     nda = out["opponents"]["nda1"]["reading"]
@@ -588,6 +591,10 @@ def test_confirmation_reads_one_opponent_when_the_other_left_no_records(tmp_path
     assert "seed 0 training: incomplete" in nda["status"] and "seed 1 evaluation: incomplete" in nda["status"]
     assert "seed 1 training" not in nda["status"] and nda["status"].endswith("references: incomplete")
     assert not out["confirmed"]
+    before = (tmp_path / "oppo_confirmation.json").read_bytes()
+    with pytest.raises(SystemExit, match="already read"):                # a confirmation is read once
+        ob.cmd_confirm(argparse.Namespace(attempt="30", worlds=att.worlds, eval_worlds=None))
+    assert (tmp_path / "oppo_confirmation.json").read_bytes() == before
 
 
 def test_evaluation_uses_the_references_view_stream_for_every_seed():
@@ -605,3 +612,94 @@ def test_evaluation_uses_the_references_view_stream_for_every_seed():
         assert tr.cfg.seed == cap.SEED and replace(tr.cfg, seed=2) == cfg      # nothing else changes
         raise KeyError                                                          # restored on an exception too
     assert tr.cfg is cfg and mt.Trainer.view_seed(tr, 3) == own != mt.Trainer.view_seed(ref, 3)
+
+
+# ---------------------------------------------------------------------------- OPPO-MC-60 (the second attempt)
+def test_attempts_keep_their_records_apart():
+    import hns.marl.repair2 as r2
+    from hns.marl import oppo_block as ob
+
+    a30, a60 = ob.ATTEMPTS["30"], ob.ATTEMPTS["60"]
+    assert ob.run_dir(a30, "full0", 0) == r2.RUNS / "OPPO_full0_s0"                 # attempt 30's names are unchanged
+    assert ob.mark_path(a30, "nda1", 1) == r2.RUNS / "oppo_nda1_s1.json"
+    assert ob.run_dir(a60, "nda1", 4) == r2.RUNS / "OPPO60_nda1_s4"
+    assert ob.mark_path(a60, "full0", 3, smoke=True) == r2.RUNS / "smoke" / "oppo60_full0_s3.json"
+    assert (a60.worlds, a60.snaps, a60.dev_seed, a60.seeds) == (60, (40, 60), 3, (3, 4, 5))
+    assert a60.conf_worlds == tuple(range(208, 216)) and a30.conf_worlds == tuple(range(200, 208))
+    used = set(ob.DEV_WORLDS) | set(r2.PANELS["selection"]) | set(a30.conf_worlds) | set(r2.TIMELINE_WORLDS) \
+        | set(r2.PANEL_WORLDS)
+    assert not used & set(a60.conf_worlds) and not set(a30.seeds) & set(a60.seeds)
+    assert set(a60.rollouts) >= {15, 30, 40, 60}
+
+
+def test_confirmation_reading_of_attempt_60_uses_its_endpoints():
+    from hns.marl import oppo_block as ob
+
+    att = ob.ATTEMPTS["60"]
+    W = att.conf_worlds
+    refs = _conf_refs(W)
+    ev = lambda **kw: _conf_ev(W, snaps=att.snaps, **kw)                # noqa: E731
+    res = {s: _conf_res(60) for s in att.seeds}
+    r = ob.read_confirmation(res, {s: ev() for s in att.seeds}, refs, W, att)
+    assert r["confirmed"], r
+    x = ob.read_confirmation({s: _conf_res(30) for s in att.seeds}, {s: ev() for s in att.seeds}, refs, W, att)
+    assert not x["c1"] and x["c4"]                                      # 30 worlds are not this attempt's budget
+    x = ob.read_confirmation(res, {s: ev(u20=0.6) for s in att.seeds}, refs, W, att)
+    assert not x["c6"]                                                  # retention against world 40
+    x = ob.read_confirmation(res, {3: ev(), 4: ev(), 5: ev(held=0.4)}, refs, W, att)
+    assert not x["c4"]                                                  # one holding seed fails the mean
+
+
+@pytest.mark.parametrize("argv", [
+    ["run", "--attempt", "60", "--opp", "full0", "--seed", "0"],          # development is seed 3
+    ["train", "--attempt", "60", "--opp", "nda1"],                        # the default seed is the development seed
+    ["train", "--attempt", "60", "--opp", "nda1", "--seed", "6"],         # not a confirmation seed
+    ["confirm-eval", "--attempt", "60", "--opp", "full0", "--seed", "1"],
+])
+def test_attempt_60_refuses_seeds_outside_its_declaration(argv, tmp_path, monkeypatch):
+    import hns.marl.repair2 as r2
+    from hns.marl import oppo_block as ob
+
+    monkeypatch.setattr(r2, "RUNS", tmp_path)
+    with pytest.raises(SystemExit, match="seed"):
+        ob.main(argv)
+    assert not list(tmp_path.iterdir())                                 # refused before any marker or run directory
+
+
+def test_snapshot_keeps_the_opponents_streams(tmp_path):
+    from types import SimpleNamespace
+
+    from hns.marl import oppo_block as ob
+
+    g = lambda k: np.random.default_rng([7, k])                          # noqa: E731
+    tr = SimpleNamespace(world=4, step_no=2000, rng=g(1), replay_rng=g(2),
+                         roles={"launderer": SimpleNamespace(state=lambda: {"actor": {}})},
+                         policies=[SimpleNamespace(rng=g(11), sched_rng=g(12))])
+    tr.rng.random(5)                                                    # a stream that has moved
+    ob.snapshot(tr, tmp_path / "w04.pt")
+    d = torch.load(tmp_path / "w04.pt", weights_only=False)
+    assert d["opp_rng"] == tr.rng.bit_generator.state and d["replay_rng"] == tr.replay_rng.bit_generator.state
+    assert (d["world"], d["step_no"]) == (4, 2000) and d["sched"] == tr.policies[0].sched_rng.bit_generator.state
+
+
+def test_block_report_compares_with_pl_at_its_world_30_for_any_endpoint(tmp_path, monkeypatch):
+    import hns.marl.repair2 as r2
+    from hns.marl import oppo_block as ob
+
+    monkeypatch.setattr(r2, "RUNS", tmp_path)
+
+    def row(j, u):
+        return {"world": j, "btc_utility": u, "reward": u, "held_frac": 0.05, "success_frac": 0.5, "frozen_frac": 0.1,
+                "fee_frac": 0.0, "frozen_change_frac": 0.0, "tranches": 1.0, "detection_rate": 0.1,
+                "cal": {"bias_btc": 0.0, "rmse": 1.0, "rmse_norm": 0.1, "explained_variance": 0.5, "g_mean": 0.3,
+                        "strata": {"low": {"n": 2, "bias": 0.1}}},
+                "options": {"decisions": 10, "waits": [1, 0, 0, 0, 1], "launches": [0] * 36, "launch_noops": 0,
+                            "hazard": {"low/0": [3, 1]}}}
+
+    rows = lambda u: [row(j, u) for j in ob.DEV_WORLDS]                  # noqa: E731
+    d = r2.run_dir("PL", "full0", 0)
+    d.mkdir(parents=True)
+    (d / "stage1.json").write_text(json.dumps({"snaps": {"20": rows(0.0), "30": rows(0.2)}}))
+    refs = {p: rows(0.4) for p in ("wait", "direct50", "repeat50")}
+    rep = ob.reported({40: rows(0.3), 60: rows(0.5)}, refs, "full0", None)
+    assert math.isclose(rep["vs"]["PL_w30"]["utility"][0], 0.3)

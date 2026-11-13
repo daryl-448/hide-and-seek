@@ -116,7 +116,9 @@ def make(opp: Path, device, out: Path | None = None, **over) -> mt.Trainer:
     cfg = MarlConfig(**base | {"arm": "nda", "seed": SEED, "episodes": WORLDS * EPISODES, "eps_episodes": EPS_EPISODES}
                      | over)
     centre = WorldParams.from_dict(cfgd["centre"])
-    tr = mt.build(cfg, device, centre, out, lambda m: print(m, flush=True))
+    # the opponents' own W moments: detector-W never trains here (only its feature count is read), and a launderer
+    # seed (OPPO-MC-60's 3-5) need not have a W split of its own
+    tr = mt.build(cfg, device, centre, out, lambda m: print(m, flush=True), norm_seed=cfgd["seed"])
     tr.learn = frozenset({"launderer"})
     tr.fixed_eps = {"innocent": OPP_EPS, "detector": OPP_EPS}
     tr.load_models(opp / "ckpt" / "final.pt", ("innocent", "detector"))

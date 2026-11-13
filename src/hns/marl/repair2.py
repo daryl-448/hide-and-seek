@@ -200,7 +200,8 @@ ALL_CELLS = CELLS | STAGE_CELLS
 RUN_ORDER = ("A", "SSF", "IHF", "IHR", "SHF", "ISF", "SSR", "SHR", "ISR", "W", "H", "LN")
 SIMPLEST_FIRST = ("IHF", "A", "SSF", "ISF", "SHF", "SSR", "ISR", "SHR", "IHR", "W", "H", "LN")
 WORLDS, EPS_EPISODES = 30, 150
-PANELS = {"selection": tuple(range(100, 108)), "confirmation": tuple(range(200, 208))}
+PANELS = {"selection": tuple(range(100, 108)), "confirmation": tuple(range(200, 208)),
+          "confirmation60": tuple(range(208, 216))}     # OPPO-MC-60's confirmation (hns.marl.oppo_block, 2026-11-13)
 PANEL_WORLDS, PANEL_STATES = (300, 301), 256           # the diagnostic panel: 256 idle + 256 in-flight states
 SNAP_REF = (16, 24)
 TIMELINE_WORLDS, TIMELINE_FROM = (400, 401), 15         # stage 0: every snapshot from world 15, on two worlds

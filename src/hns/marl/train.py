@@ -539,12 +539,14 @@ class Trainer:
         return res
 
 
-def build(cfg: MarlConfig, device, centre: WorldParams, out: Path | None, log=print) -> Trainer:
-    """A trainer on the real frozen moments; the Full arm also loads the real fitting-split views."""
+def build(cfg: MarlConfig, device, centre: WorldParams, out: Path | None, log=print,
+          norm_seed: int | None = None) -> Trainer:
+    """A trainer on the real frozen moments; the Full arm also loads the real fitting-split views. ``norm_seed``: the
+    seed whose W moments to load (default ``cfg.seed``)."""
     from hns.models.hrg import TaskData
 
     stats_t = Normalizer.load(NORM_DIR / "T.json").stats
-    norm_w = Normalizer.load(NORM_DIR / f"W_seed{cfg.seed}.json")
+    norm_w = Normalizer.load(NORM_DIR / f"W_seed{cfg.seed if norm_seed is None else norm_seed}.json")
     real_t = real_w = None
     if cfg.da:
         real_t = RealViews.task_t(TaskData("T", cfg.seed, k1=cfg.k1, k2=cfg.k2, cap=cfg.cap))
