@@ -216,6 +216,30 @@ read on worlds 208-215, the six criteria and every tolerance unchanged, and Full
 bound above -.05) applies in full. A confirmation pass therefore stands on the confirmation alone. It does not undo
 the development miss, and the report states both. The script runs this with ``scripts/m5_oppo60.sh confirm``.
 
+**Confirmation reading of OPPO-MC-60 (2026-11-13, A30, run r_64ac9a83, ``runs/repair2/oppo60_confirmation.json``):
+not confirmed.** Every step completed (0 failed); both readings are complete.
+
+- Full-0, **not confirmed**: criterion 6 fails. Retention, the seeds' mean U60 - U40, is -.036 [-.089, +.016] (the
+  lower bound must be above -.05). Per seed: -.011, +.008, -.106 (seed 5: .664 to .559 with held .032, so the drop
+  is not held funds). Per world it runs from -.136 to +.055. The other five hold: U +.585 (seeds .583, .614, .559;
+  direct50 .701), R +.564; vs wait +.585 [+.535, +.635]; critic bias +.03, +.02, -.01 (tolerance .5); held -
+  direct50 -.065 [-.080, -.050]; matched +.650, vs uniform +1.55 [+1.47, +1.63], vs initial +1.50 [+1.38, +1.61].
+- NDA-1, **confirmed** (6 of 6): U +.619 (seeds .642, .640, .575; direct50 .682), R +.596; vs wait +.619 [+.567,
+  +.672]; critic bias +.25, +.01, -.05; held - direct50 -.027 [-.050, -.005]; matched +.622, vs uniform +1.55 [+1.40,
+  +1.69], vs initial +1.50 [+1.31, +1.69]; retention +.022 [-.042, +.087]. In training, seeds 3 and 5 held about .5
+  over worlds 21-30, as seed 1 of attempt 30 did. Both reopened by worlds 31-40 (held .05 and .03).
+- Reported, not gated: final utility minus ``direct50``'s is -.116 [-.190, -.041] for Full-0 and -.063 [-.198,
+  +.072] for NDA-1. Argmax by seed: Full-0 .644, .646, .659; NDA-1 .638, .633, .485. Natural launches are 96 % (Full-0)
+  and 99 % (NDA-1) direct at 0.5. Initial-actor spread across seeds: 0 in both.
+- In training, Full-0's utility levels off from about world 31 (ten-world means .57-.66 for every seed). The world-40
+  and world-60 policies are both on that plateau, and their difference on worlds 208-215 has a world-to-world
+  standard deviation of .063.
+
+The six criteria, as declared, are not met for both opponents in one attempt. Full-0 passed attempt 30 and failed
+attempt 60; NDA-1 failed attempt 30 and passed attempt 60. Runs of different attempts are not combined, and neither
+opponent's learner is chosen separately, so the live pilot is not permitted. Nothing is re-run; a new declaration
+follows (the user's call).
+
 Usage::
 
     scripts/m5_repair2.sh oppo full0       (attempt 30: oppo_block run, train then read; the 45-minute cap)
