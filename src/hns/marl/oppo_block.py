@@ -198,12 +198,31 @@ incomplete or numerically failed step is never a pass; only the user may void an
 fault. Both opponents confirmed -> the live pilot (SPEC §10, step 3: 60 fresh worlds per arm, a world-30 fork, worlds
 216-223), declared in full before it runs. Otherwise the failing criteria are reported and a new declaration follows.
 
+**Development reading of OPPO-MC-60** (2026-11-13, A30, run r_05cc8ecc; each block one attempt, read once;
+``oppo60_{opp}_s3.json`` and ``logs/oppo60_dev_{opp}.log``):
+
+- NDA-1, seed 3: promising, all five criteria. U60 .664 (bar .292), R .635 (bar .269); U60 - U40 +.005
+  [-.119, +.128]; critic bias +.11 (tolerance .5); held excess over ``direct50`` -.052 [-.099, -.005]; matched minus
+  uniform +1.52 [+1.36, +1.67].
+- Full-0, seed 3: not promising, c3 only. Mean U60 - U40 -.0522 against the bar of -.05 (worlds 100-103: -.013, -.151,
+  +.019, -.062; world 101's held share rose from .026 to .215 and its utility fell from .601 to .450). The rest pass:
+  U60 .549 (bar .402), R .529 (bar .323), critic bias +.01, held excess -.007 [-.140, +.126], matched minus uniform
+  +1.51 [+1.36, +1.65].
+
+**Deviation (the user's, 2026-11-13).** As declared, only both blocks promising permit the confirmation. The user
+approved running it anyway ("run it"), knowing Full-0's block missed c3 by .002. Both development readings stand as
+read above and are not amended. The confirmation runs exactly as declared: seeds 4 and 5 fresh, seeds 3, 4 and 5
+read on worlds 208-215, the six criteria and every tolerance unchanged, and Full-0's c6 (the paired U60 - U40 lower
+bound above -.05) applies in full. A confirmation pass therefore stands on the confirmation alone. It does not undo
+the development miss, and the report states both. The script runs this with ``scripts/m5_oppo60.sh confirm``.
+
 Usage::
 
     scripts/m5_repair2.sh oppo full0       (attempt 30: oppo_block run, train then read; the 45-minute cap)
     python -m hns.marl.oppo_block read --opp full0     (only after a harness fault in the reading)
     scripts/m5_oppo_confirm.sh             (attempt 30, on the A30: the confirmation)
     scripts/m5_oppo60.sh [smoke]           (attempt 60, on the A30: both development blocks, then the confirmation)
+    scripts/m5_oppo60.sh confirm           (attempt 60: the confirmation only; the deviation above)
 """
 
 from __future__ import annotations

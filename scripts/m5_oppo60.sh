@@ -9,7 +9,9 @@
 # references (runs/repair2/ref_*_selection_*.json) and legacy A's and PL's records (runs/repair2/{A,PL}_*_s0).
 # After step 1 every step runs even if an earlier one failed (the reading marks what is missing as incomplete);
 # the script exits non-zero if any step failed, and 3 if the development blocks did not both read promising.
-#   scripts/m5_oppo60.sh [smoke]   (smoke: 2 training worlds, 1 evaluation world, no gate; runs/repair2/smoke)
+#   scripts/m5_oppo60.sh [smoke|confirm]   (smoke: 2 training worlds, 1 evaluation world, no gate; runs/repair2/smoke)
+#   confirm: steps 2-4 only, no development step and no gate; the user's recorded deviation of 2026-11-13 (the
+#   development blocks had run and Full-0's missed c3; see hns.marl.oppo_block). Seed 3's runs must be on the instance.
 #   logs: runs/repair2/logs/oppo60_*.log
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -44,8 +46,10 @@ barrier() {  # wait for every started job, one by one, and count the failures
   done
   PIDS=() NAMES=()
 }
-for o in full0 nda1; do step "dev_$o" 3600 hns.marl.oppo_block run "${A[@]}" --opp "$o" "${RUN[@]}"; done
-if [ -z "$P" ]; then                   # the confirmation runs only if both development blocks read promising
+if [ "${1:-}" != confirm ]; then
+  for o in full0 nda1; do step "dev_$o" 3600 hns.marl.oppo_block run "${A[@]}" --opp "$o" "${RUN[@]}"; done
+fi
+if [ -z "$P" ] && [ "${1:-}" != confirm ]; then  # the confirmation runs only if both development blocks read promising
   if ! uv run python - <<'EOF'
 import json, sys
 from pathlib import Path
