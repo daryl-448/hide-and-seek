@@ -307,6 +307,65 @@ def test_options_curriculum_then_natural_decisions(tmp_path, monkeypatch):
     assert rec2["updates"]["launderer"] > rec1["updates"]["launderer"] and "launderer" not in rec2["buffer"]
 
 
+def _sig(m) -> tuple[float, float]:
+    """A network's parameters as two sums: equal for the same weights, different after an update."""
+    ps = [p.detach().double() for p in m.parameters()]
+    return float(sum(p.sum() for p in ps)), float(sum((p * p).sum() for p in ps))
+
+
+def test_live_play_opponents_act_with_their_world_start_networks(tmp_path, monkeypatch):
+    tr = _trainer(tmp_path, monkeypatch, episodes=6, curriculum=1)
+    inn, D = tr.roles["innocent"], tr.det
+    same = lambda: (inn.act_net is inn.net, D.act_t is D.det_t, D.act_gq is D.gq)     # noqa: E731
+    assert all(same())
+    seen = []
+    tr.after_update = lambda t: seen.append((t.world, same(), _sig(inn.act_net), _sig(D.act_t), _sig(D.act_gq),
+                                             _sig(inn.net), _sig(D.det_t), _sig(D.gq)))
+    start, end = {}, {}
+    for w in range(3):
+        start[w] = (_sig(inn.net), _sig(D.det_t), _sig(D.gq))
+        rec = tr.run_world()
+        end[w] = (_sig(inn.net), _sig(D.det_t), _sig(D.gq))
+        assert all(same())                                              # a world's end drops the copies
+    assert rec["updates"]["innocent"] > 0 and rec["updates"]["detector_t"] > 0
+    assert len(seen) == 3 * 2 * 12
+    for w, sm, ai, at, ag, *_ in seen:                                  # every sub-step acted with the world-start copies
+        assert not any(sm) and (ai, at, ag) == start[w]
+    last = [s for s in seen if s[0] == 2][-1]
+    assert last[5] != start[2][0] and last[6] != start[2][1]            # while the learners moved within the world
+    assert start[1] == end[0] and start[2] == end[1]                    # and what they learned acts from the next world on
+    assert not any(p.requires_grad for p in _target_params(tr))        # the copies are never trained
+
+
+def _target_params(tr):
+    tr._acting(world_start=True)
+    ps = [*tr.roles["innocent"].act_net.parameters(), *tr.det.act_t.parameters(), *tr.det.act_gq.parameters()]
+    tr._acting(world_start=False)
+    return ps
+
+
+def test_acting_copies_are_for_live_oppo_play_only(tmp_path, monkeypatch):
+    # frozen opponents (the capability runs): they never learn, so they act with their own networks
+    tr = _trainer(tmp_path, monkeypatch, episodes=2, curriculum=1)
+    tr.learn, tr.fixed_eps = frozenset({"launderer"}), {"innocent": 0.05, "detector": 0.05}
+    inn, D = tr.roles["innocent"], tr.det
+    flags = []
+    tr.after_update = lambda t: flags.append((inn.act_net is inn.net, D.act_t is D.det_t, D.act_gq is D.gq))
+    tr.run_world()
+    assert flags and all(all(f) for f in flags)
+    # a Q-learning launderer (M5's first runs): acting and learning networks stay the same objects
+    st = identity_stats()
+    cfg = MarlConfig(arm="nda", seed=0, episodes=2, warmup=30, batch=8, buffer=400, ckpt_worlds=1)
+    out = tmp_path / "q"
+    out.mkdir()
+    tq = mt.Trainer(cfg, torch.device("cpu"), TINY, st, Normalizer(st), None, None, out, log=lambda *_: None)
+    flags = []
+    tq.after_update = lambda t: flags.append((tq.roles["innocent"].act_net is tq.roles["innocent"].net,
+                                              tq.det.act_t is tq.det.det_t, tq.det.act_gq is tq.det.gq))
+    tq.run_world()
+    assert flags and all(all(f) for f in flags)
+
+
 @pytest.fixture
 def guard_world(tmp_path, monkeypatch):
     """A natural world's closed rollout, collected by the current actor, with several logical minibatches per pass
@@ -389,6 +448,9 @@ def test_kl_guard_undoes_only_the_crossing_step(guard_world, monkeypatch):
 
 def test_kl_guard_measures_the_whole_world_against_the_collecting_actor(guard_world, monkeypatch):
     tr, L, ro, state0, restore, steps = guard_world
+    # one decision with a single feasible duration, whatever the world played: a launch's durations are unused, so
+    # its stored probability and value stand
+    next(r for r in ro.rows if r.action[0] == P.LAUNCH).masks[P.SLICES["dur"]] = (True, False, False, False, False)
     m = np.stack([r.masks for r in ro.rows])
     support = [len(ro.rows), int(m[:, P.SLICES["gate"]][:, P.LAUNCH].sum()), int((m[:, P.SLICES["dur"]].sum(1) > 1).sum())]
     assert support[2] < support[0]                                # rows with a single feasible duration exist

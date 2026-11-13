@@ -48,7 +48,7 @@ import yaml
 
 from hns.data.norm import NORM_DIR, Normalizer
 from hns.eval.rf_anchor import git_sha
-from hns.marl.learner import DetectorLearner, MarlConfig, RealViews, RoleLearner, SimW
+from hns.marl.learner import DetectorLearner, MarlConfig, RealViews, RoleLearner, SimW, _target_of
 from hns.marl.oppo import CURRICULUM_WORLDS, OppoLearner, OptionPolicy
 from hns.marl.obs import Featurizer, detector_obs, innocent_obs, launderer_obs, pack_masks, world_readout
 from hns.models.qnet import sample_actions
@@ -183,7 +183,14 @@ ROLES = ("launderer", "innocent", "detector")
 class Trainer:
     """The MARL loop. ``learn``: the roles that store transitions and update (all three in M5); a role outside it
     acts with its current networks at the fixed epsilon ``fixed_eps[role]`` and is never updated (frozen-opponent
-    diagnostics, ``hns.marl.capability``). A frozen detector also skips detector-W and the world export."""
+    diagnostics, ``hns.marl.capability``). A frozen detector also skips detector-W and the world export.
+
+    Live play with OPPO-MC launderers (SPEC §10, "Acting policies in live play"): through a world every role acts
+    with its networks as of the world's start. The launderers' actor is fixed for the world anyway; a learning
+    innocent or inspector acts with a copy made at the world's start (:meth:`_acting`) while its learner keeps
+    updating its own networks every sub-step, with the same counts and losses. Those become the acting networks at
+    the next world's start. Between worlds the acting and learning networks are the same objects, so a checkpoint
+    (always at a world boundary) holds both, and a resume starts a complete world."""
 
     def __init__(self, cfg: MarlConfig, device, centre: WorldParams, stats_t: dict, norm_w: Normalizer,
                  real_t: RealViews | None = None, real_w: RealViews | None = None, out: Path | None = None,
@@ -224,6 +231,17 @@ class Trainer:
 
     def view_seed(self, salt: int) -> int:
         return (self.cfg.seed * 1_000_003 + self.step_no) * 16 + salt
+
+    def _acting(self, world_start: bool) -> None:
+        """The opponents' acting networks (class docstring): at the start of a world of live OPPO-MC play, frozen
+        copies of each learning opponent's networks; otherwise (a world's end, a Q-learning launderer, a frozen
+        opponent) the learning networks themselves. A world that raises leaves its copies in place: that trainer is
+        discarded, not evaluated or reloaded."""
+        inn, D = self.roles["innocent"], self.det
+        live = world_start and self.oppo
+        inn.act_net = _target_of(inn.net) if live and "innocent" in self.learn else inn.net
+        D.act_t, D.act_gq = ((_target_of(D.det_t), _target_of(D.gq)) if live and "detector" in self.learn
+                             else (D.det_t, D.gq))
 
     # --- one sub-step
     def after_step(self, env, res, ep: dict) -> None:
@@ -325,6 +343,7 @@ class Trainer:
         self.world_step, self.launches = self.step_no, np.zeros((len(STRATEGIES), len(AMOUNTS), 2), np.int64)
         if self.oppo:                                    # the first worlds launch on a schedule (curriculum, §10)
             self.policies[0].begin_world(scheduled=w < CURRICULUM_WORLDS)
+        self._acting(world_start=True)
         losses, tot = defaultdict(list), defaultdict(float)
         u0, ratio, t_world = self.det.n_updates, [], time.perf_counter()
         for e in range(EPISODES):
@@ -353,6 +372,7 @@ class Trainer:
             for k, v in ep.items():
                 tot[k] += v
         # world end: terminal transitions, then detector-W on the pruned export (§10)
+        self._acting(world_start=False)
         for name, L in self.roles.items():
             if self.oppo and name == "launderer":         # every decision chain closes, then the world's update
                 ro = self.policies[0].finish(self.step_no)

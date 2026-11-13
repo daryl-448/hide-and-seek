@@ -254,6 +254,7 @@ class RoleLearner:
                           dropout=cfg.q_dropout, head=head).to(device)
         self.targ = _target_of(self.net)
         _amp(cfg, self.net.enc, self.targ.enc)
+        self.act_net = self.net        # the network that acts: a world-start copy in live OPPO-MC play (Trainer)
         self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr)
         self.sizes = self.net.sizes
         arch = int(ARCHIVE_SHARE * cfg.buffer) if d["replay"] == "archive" else 0
@@ -293,7 +294,7 @@ class RoleLearner:
         """The behaviour policy's option of every branch, ``(B, n_branches)``."""
         tau = self.cfg.tau if tau is None else tau
         if not self.joint:
-            return sample_actions(self.q_values(ob, masks), self.sizes, tau, eps, rng)
+            return sample_actions(self.q_values(ob, masks, self.act_net), self.sizes, tau, eps, rng)
         self.net.eval()
         H = self.net.heads
         root, u, a = (x.cpu().numpy() for x in self._checked(ob, masks)[0])
@@ -319,13 +320,15 @@ class RoleLearner:
         return parts, float(top)
 
     @torch.no_grad()
-    def q_values(self, ob: ObsBatch, masks: np.ndarray) -> np.ndarray:
+    def q_values(self, ob: ObsBatch, masks: np.ndarray, net=None) -> np.ndarray:
         """``Q`` of every option for acting (the joint critic's per-branch view); a non-finite value at a feasible
-        option, or at any feasible complete action of the joint critic, raises."""
-        self.net.eval()
+        option, or at any feasible complete action of the joint critic, raises. ``net``: the learning network
+        unless given (:meth:`act` passes the acting one; the joint critic has no other)."""
+        net = self.net if net is None else net
+        net.eval()
         if self.joint:
             return self.net.heads.layout(self._checked(ob, masks)[0], _t(masks, self.device)).cpu().numpy()
-        q = self._q(self.net, ob, masks).cpu().numpy()
+        q = self._q(net, ob, masks).cpu().numpy()
         if not np.isfinite(q[masks]).all():
             raise FloatingPointError(f"{self.role}: non-finite Q at a feasible option")
         return q
@@ -636,6 +639,7 @@ class DetectorLearner:
         self.gq = GlobalQ(BRANCHES["detector"], G_DIM).to(device)
         self.gq_targ = _target_of(self.gq)
         _amp(cfg, self.det_t, self.det_w)
+        self.act_t, self.act_gq = self.det_t, self.gq     # the acting inspector: world-start copies in live OPPO-MC play
         self.opt_t = torch.optim.Adam([*self.det_t.parameters(), *self.gq.parameters()], lr=cfg.lr)
         self.opt_w = torch.optim.Adam(self.det_w.parameters(), lr=cfg.lr)
         self.flag_buf = Replay(cfg.buffer, [2])
@@ -649,16 +653,16 @@ class DetectorLearner:
     @torch.no_grad()
     def global_q(self, gvec: np.ndarray) -> np.ndarray:
         """Q of the global branches in units of ``global_scale`` reward: sample with ``g_tau``."""
-        self.gq.eval()
+        self.act_gq.eval()
         m = torch.ones(1, sum(self.gq.sizes), dtype=torch.bool, device=self.device)
-        return self.gq(_t(gvec[None], self.device), m).cpu().numpy()
+        return self.act_gq(_t(gvec[None], self.device), m).cpu().numpy()
 
     @torch.no_grad()
     def flag_margin(self, ob: ObsBatch) -> np.ndarray:
         """``Q_flag - Q_skip`` per candidate, on clean features."""
-        self.det_t.eval()
+        self.act_t.eval()
         g, f = ob.tensors(self.device)
-        q = self.det_t.flag_q(self.det_t.encode(g, f["x_tx"], f["x_w"]))
+        q = self.act_t.flag_q(self.act_t.encode(g, f["x_tx"], f["x_w"]))
         return (q[:, 1] - q[:, 0]).cpu().numpy()
 
     # --- learning

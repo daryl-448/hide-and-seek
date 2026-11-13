@@ -28,8 +28,8 @@ On-policy PPO over the launderer's options, with complete-world Monte Carlo retu
 Before any update, the stored log-probabilities are recomputed from the stored observations (``ratio_dev_max``,
 the largest difference: the probability ratios start at one) and so are the values (``value_dev_max``).
 
-Not implemented here (SPEC §10, before the live pilot): the per-world acting copies of the live game's roles, and
-NMAI's static option launderers.
+The live game's per-world acting copies of the other roles are the trainer's (``hns.marl.train.Trainer._acting``).
+Not implemented yet (SPEC §11, before M6): NMAI's static option launderers.
 """
 
 from __future__ import annotations
